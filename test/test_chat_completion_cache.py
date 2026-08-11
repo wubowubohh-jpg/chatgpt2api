@@ -480,6 +480,69 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], ["system", "user"])
         self.assertEqual(messages[0]["content"], "developer instruction")
 
+    def test_responses_additional_tools_are_exposed_to_web_model(self) -> None:
+        _model, messages = openai_v1_response.text_response_parts({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "custom", "name": "exec", "description": "Run commands."}],
+                },
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read README.md"}]},
+            ],
+        })
+
+        self.assertEqual(messages[-1], {"role": "user", "content": "read README.md"})
+        self.assertIn("codex_tool_call", messages[0]["content"])
+        self.assertIn("exec (custom)", messages[0]["content"])
+        self.assertNotIn("cannot execute local tools", "\n".join(str(item.get("content")) for item in messages))
+
+    def test_responses_tool_history_is_forwarded_to_web_model(self) -> None:
+        _model, messages = openai_v1_response.text_response_parts({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "exec"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "inspect the project"}]},
+                {"type": "custom_tool_call", "name": "exec", "call_id": "call_1", "input": "const r = await tools.shell_command({command: \"Get-ChildItem\"}); text(r)"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "README.md"}]},
+            ],
+        })
+
+        self.assertEqual([message["role"] for message in messages[1:]], ["user", "assistant", "user"])
+        self.assertIn("Get-ChildItem", messages[2]["content"])
+        self.assertIn("README.md", messages[3]["content"])
+
+    def test_responses_custom_tool_call_events_are_codex_compatible(self) -> None:
+        body = {
+            "model": "gpt-5.6-sol",
+            "stream": True,
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "exec"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read README.md"}]},
+            ],
+        }
+        marker = '<codex_tool_call name="exec"><![CDATA[const r = await tools.shell_command({command: "Get-Content README.md"}); text(r)]]></codex_tool_call>'
+
+        def fake_stream_text_deltas(_backend, _request):
+            yield marker
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            events = list(openai_v1_response.handle(body))
+
+        event_types = [event["type"] for event in events]
+        self.assertEqual(event_types[0], "response.created")
+        self.assertIn("response.custom_tool_call_input.delta", event_types)
+        self.assertIn("response.custom_tool_call_input.done", event_types)
+        completed = events[-1]["response"]
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["output"][0]["type"], "custom_tool_call")
+        self.assertEqual(completed["output"][0]["name"], "exec")
+        self.assertIn("Get-Content README.md", completed["output"][0]["input"])
+
     def test_responses_web_search_tool_returns_search_output(self) -> None:
         search_result = {
             "answer": "Latest answer.",
