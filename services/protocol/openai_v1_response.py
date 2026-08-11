@@ -634,23 +634,53 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                     action = {"action": "tool", **legacy_calls[0]}
                 if action is None and turn_has_tool_output:
                     action = _plain_controller_final(full_text)
+                duplicate_action = codex_tool_bridge.action_repeats_completed_tool(
+                    action,
+                    body.get("input"),
+                    seed_items=getattr(plan, "prior_output_items", None),
+                )
                 rejected_action = (
                     action is not None
                     and (
-                        (action.get("action") == "final" and codex_tool_bridge.is_access_refusal(str(action.get("text") or "")))
+                        (
+                            action.get("action") == "final"
+                            and (
+                                codex_tool_bridge.is_access_refusal(str(action.get("text") or ""))
+                                or codex_tool_bridge.is_task_evasion(str(action.get("text") or ""))
+                            )
+                        )
                         or (
                             completion_required
                             and action.get("action") == "final"
                             and not codex_tool_bridge.final_action_is_complete(action)
                         )
                         or (force_tool and not codex_tool_bridge.is_local_executor_action(action))
+                        or duplicate_action
                     )
                 )
                 invalid_output = action is None
                 if rejected_action or invalid_output:
                     repaired_text = ""
+                    repair_context = full_text
+                    if duplicate_action:
+                        repair_context = (
+                            "DUPLICATE_COMPLETED_TOOL_ACTION\n"
+                            "The proposed action already has a tool result in the current task. "
+                            "Choose a different next action or return complete:true only if the task is actually finished.\n"
+                            + full_text
+                        )
                     if request.conversation_id and request.parent_message_id:
-                        repair_messages = codex_tool_bridge.controller_repair_messages(full_text)
+                        repair_messages = codex_tool_bridge.controller_repair_messages(repair_context)
+                        repair_messages.extend(
+                            codex_tool_bridge.controller_task_contract_messages(
+                                getattr(plan, "canonical_input_items", None) or body.get("input")
+                            )
+                        )
+                        repair_messages.extend(
+                            codex_tool_bridge.controller_task_anchor_messages(
+                                getattr(plan, "canonical_input_items", None) or body.get("input")
+                            )
+                        )
                         repair_conversation_id = request.conversation_id
                         repair_parent_message_id = request.parent_message_id
                     else:
@@ -658,7 +688,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                             body,
                             client_tools,
                             force_tool=force_tool,
-                            invalid_output=full_text,
+                            invalid_output=repair_context,
                         )
                         repair_conversation_id = ""
                         repair_parent_message_id = ""
@@ -690,7 +720,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                             body,
                             client_tools,
                             force_tool=force_tool,
-                            invalid_output=full_text,
+                            invalid_output=repair_context,
                         )
                         repair_conversation_id = ""
                         repair_parent_message_id = ""
@@ -734,12 +764,20 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                     repaired_refusal = (
                         repaired_action is not None
                         and repaired_action.get("action") == "final"
-                        and codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
+                        and (
+                            codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
+                            or codex_tool_bridge.is_task_evasion(str(repaired_action.get("text") or ""))
+                        )
                     )
                     repaired_force_tool_rejection = (
                         force_tool
                         and repaired_action is not None
                         and not codex_tool_bridge.is_local_executor_action(repaired_action)
+                    )
+                    repaired_duplicate_action = codex_tool_bridge.action_repeats_completed_tool(
+                        repaired_action,
+                        body.get("input"),
+                        seed_items=getattr(plan, "prior_output_items", None),
                     )
                     repaired_completion_rejection = (
                         completion_required
@@ -751,16 +789,19 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                         repaired_action is not None
                         and not repaired_refusal
                         and not repaired_force_tool_rejection
+                        and not repaired_duplicate_action
                         and not repaired_completion_rejection
                     ):
                         action = repaired_action
                         full_text = repaired_text
                         request = repair_request
                         request_parent_before = repair_parent_before
-                    elif force_tool or completion_required:
+                    elif force_tool:
                         action = codex_tool_bridge.bootstrap_local_action(client_tools)
                         request = repair_request
                         request_parent_before = repair_parent_before
+                    elif completion_required:
+                        raise RuntimeError("Codex tool controller could not produce a valid follow-up action")
                     else:
                         raise RuntimeError("Codex tool controller could not produce a valid action")
                 if action is None:

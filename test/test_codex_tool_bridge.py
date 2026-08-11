@@ -826,11 +826,30 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertIn("custom_tool_call_output", continuation_text)
         self.assertIn("README.md", continuation_text)
         self.assertNotIn(environment, continuation_text)
-        self.assertIn("CODEX_TASK_ANCHOR original_user_request", continuation_text)
+        self.assertIn("CONTROLLER_TASK_CONTRACT", continuation_text)
+        self.assertIn("CODEX_TASK_ANCHOR active_user_request", continuation_text)
         self.assertIn("read the current project", continuation_text)
         self.assertIn("force_local_tool=false", continuation_text)
         final_output = second_events[-1]["response"]["output"][0]
         self.assertEqual(final_output["content"][0]["text"], "README.md is present")
+
+    def test_task_contract_keeps_analysis_request_valid_without_code_change(self) -> None:
+        body = codex_body(
+            {"type": "message", "role": "user", "content": "详细了解当前项目，给出优化方案"},
+        )
+        tools = codex_tool_bridge.response_client_tools({
+            **body,
+            "tools": [{"type": "custom", "name": "exec", "description": "Run local commands"}],
+        })
+        messages = codex_tool_bridge.controller_messages({**body, "input": body["input"]}, tools)
+        transcript = "\n".join(str(message["content"]) for message in messages)
+
+        self.assertIn("task_kind=analysis_or_planning", transcript)
+        self.assertIn("A response claiming that no coding task", transcript)
+        self.assertIn("code modification is not required", transcript.lower())
+        self.assertTrue(codex_tool_bridge.is_task_evasion(
+            "No coding task or requested change was included in the provided context."
+        ))
 
     def test_plain_text_after_tool_result_is_repaired_before_final(self) -> None:
         body = codex_body(
@@ -859,6 +878,109 @@ class CodexToolBridgeTests(unittest.TestCase):
 
         self.assertEqual(stream.call_count, 2)
         self.assertEqual(events[-1]["response"]["output"][0]["content"][0]["text"], "README.md is present")
+
+    def test_task_evasion_is_repaired_with_next_tool_instead_of_bootstrap_repeat(self) -> None:
+        first = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "user", "content": "详细了解当前项目，给出优化方案"},
+        )
+        first.update({
+            "prompt_cache_key": "task-contract-session",
+            "_request_identity_key_id": "admin",
+            "client_metadata": {"session_id": "session-contract", "thread_id": "thread-contract", "turn_id": "turn-1"},
+        })
+        first_outputs = iter([
+            '{"action":"tool","name":"exec","input":"const r = await tools.shell_command({command: \'Get-ChildItem -Force\'}); text(r);"}',
+        ])
+        captured = []
+
+        def first_stream(_backend, request):
+            captured.append(request)
+            request.conversation_id = "conv-contract"
+            request.parent_message_id = "node-1"
+            request.access_token = "token-contract"
+            yield next(first_outputs)
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=first_stream),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.resolve_access_token",
+                side_effect=lambda token: token,
+            ),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.get_account",
+                return_value={"status": "normal"},
+            ),
+        ):
+            first_events = list(openai_v1_response.handle(first))
+
+        call_item = next(
+            event["item"]
+            for event in first_events
+            if event["type"] == "response.output_item.done" and event["item"]["type"] == "custom_tool_call"
+        )
+        continuation = {
+            **first,
+            "input": [
+                *first["input"],
+                call_item,
+                {"type": "custom_tool_call_output", "call_id": call_item["call_id"], "output": "README.md"},
+            ],
+        }
+        continuation["client_metadata"] = {**first["client_metadata"], "turn_id": "turn-2"}
+        continuation_outputs = iter([
+            "No coding task or requested change was included in the provided context.",
+            '{"action":"tool","name":"exec","input":"const r = await tools.shell_command({command: \'Get-Content README.md -TotalCount 20\'}); text(r);"}',
+        ])
+
+        def continuation_stream(_backend, request):
+            captured.append(request)
+            request.conversation_id = "conv-contract"
+            request.parent_message_id = "node-2"
+            request.access_token = "token-contract"
+            yield next(continuation_outputs)
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=continuation_stream),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.resolve_access_token",
+                side_effect=lambda token: token,
+            ),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.get_account",
+                return_value={"status": "normal"},
+            ),
+        ):
+            events = list(openai_v1_response.handle(continuation))
+
+        self.assertEqual(len(captured), 3)
+        item = next(event["item"] for event in events if event["type"] == "response.output_item.done")
+        self.assertEqual(item["type"], "custom_tool_call")
+        self.assertIn("Get-Content README.md", item["input"])
+        self.assertNotIn("Get-ChildItem -Force", item["input"])
+
+    def test_two_invalid_followup_outputs_fail_without_repeating_bootstrap_tool(self) -> None:
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "user", "content": "inspect the current project"},
+            {"type": "custom_tool_call", "name": "exec", "call_id": "call-1", "input": "text('listed')"},
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "README.md"},
+        )
+        outputs = iter([
+            "No coding task or requested change was included in the provided context.",
+            "No coding task or requested change was included in the provided context.",
+        ])
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=lambda _backend, _request: iter([next(outputs)])) as stream,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "valid follow-up action"):
+                list(openai_v1_response.handle(body))
+
+        self.assertEqual(stream.call_count, 2)
 
     def test_conversation_cursor_is_captured_and_reused_in_payload(self) -> None:
         payloads = [

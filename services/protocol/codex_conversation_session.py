@@ -33,6 +33,8 @@ class ContinuationPlan:
     output_items: list[dict[str, Any]] = field(default_factory=list)
     response_id: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    canonical_input_items: list[Any] = field(default_factory=list)
+    prior_output_items: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -50,6 +52,7 @@ class _Session:
     usage: dict[str, Any]
     session_id: str
     turn_id: str
+    last_request_signature: str
     updated_at: float = field(default_factory=time.monotonic)
 
 
@@ -64,6 +67,22 @@ def _model_signature(value: object) -> str:
 def _client_metadata(body: dict[str, Any]) -> dict[str, Any]:
     value = body.get("client_metadata")
     return value if isinstance(value, dict) else {}
+
+
+def _previous_response_id(body: dict[str, Any]) -> str:
+    return str(body.get("previous_response_id") or "").strip()
+
+
+def _request_signature(body: dict[str, Any]) -> str:
+    """Identify a retried Responses request without including gateway metadata."""
+    return _json_signature({
+        "model": body.get("model"),
+        "instructions": body.get("instructions"),
+        "input": body.get("input"),
+        "tools": body.get("tools"),
+        "tool_choice": body.get("tool_choice"),
+        "previous_response_id": _previous_response_id(body),
+    })
 
 
 def _session_key(body: dict[str, Any]) -> str:
@@ -118,6 +137,50 @@ def _same_output_item(current: object, expected: object) -> bool:
     return False
 
 
+def _same_input_item(current: object, expected: object) -> bool:
+    if current == expected:
+        return True
+    if not isinstance(current, dict) or not isinstance(expected, dict):
+        return False
+    current_type = str(current.get("type") or "message")
+    expected_type = str(expected.get("type") or "message")
+    if current_type != expected_type:
+        return False
+    if current_type in codex_tool_bridge.TOOL_CALL_TYPES | codex_tool_bridge.TOOL_OUTPUT_TYPES:
+        return _same_output_item(current, expected)
+    return False
+
+
+def _prefix_length(current: list[Any], expected: list[Any]) -> int | None:
+    if len(current) < len(expected):
+        return None
+    if all(_same_input_item(current[index], item) for index, item in enumerate(expected)):
+        return len(expected)
+    return None
+
+
+def _longest_history_overlap(history: list[Any], current: list[Any]) -> int:
+    """Return the number of current items already present at history's tail."""
+    maximum = min(len(history), len(current))
+    for size in range(maximum, 0, -1):
+        if all(
+            _same_input_item(history[len(history) - size + index], current[index])
+            for index in range(size)
+        ):
+            return size
+    return 0
+
+
+def _tool_call_seed(items: list[Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("call_id") or ""): item
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("type") or "") in codex_tool_bridge.TOOL_CALL_TYPES
+        and str(item.get("call_id") or "")
+    }
+
+
 def _drop_replayed_output_items(
     suffix: list[Any],
     output_items: list[dict[str, Any]],
@@ -138,15 +201,23 @@ class _SessionStore:
         self._lock = RLock()
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._key_locks: dict[str, RLock] = {}
+        self._response_keys: dict[str, str] = {}
 
     def clear(self) -> None:
         with self._lock:
             self._sessions.clear()
             self._key_locks.clear()
+            self._response_keys.clear()
+
+    def _lookup_key(self, body: dict[str, Any]) -> str:
+        previous_response_id = _previous_response_id(body)
+        with self._lock:
+            response_key = self._response_keys.get(previous_response_id, "")
+        return response_key or _session_key(body)
 
     @contextmanager
     def session_lock(self, body: dict[str, Any]) -> Iterator[None]:
-        key = _session_key(body)
+        key = self._lookup_key(body)
         if not key:
             yield
             return
@@ -163,17 +234,25 @@ class _SessionStore:
         *,
         force_tool: bool,
     ) -> ContinuationPlan:
-        key = _session_key(body)
+        key = self._lookup_key(body)
         input_value = body.get("input")
         if not key or not isinstance(input_value, list):
-            return ContinuationPlan(key=key, messages=full_messages)
+            return ContinuationPlan(
+                key=key,
+                messages=full_messages,
+                canonical_input_items=copy.deepcopy(input_value) if isinstance(input_value, list) else [],
+            )
 
         now = time.monotonic()
         with self._lock:
             self._expire_locked(now)
             session = self._sessions.get(key)
             if session is None:
-                return ContinuationPlan(key=key, messages=full_messages)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
             metadata = _client_metadata(body)
             session_id = str(metadata.get("session_id") or "").strip()
             turn_id = str(metadata.get("turn_id") or "").strip()
@@ -185,9 +264,52 @@ class _SessionStore:
                 or input_value[:len(session.input_items)] != session.input_items
             ):
                 self._sessions.pop(key, None)
-                return ContinuationPlan(key=key, messages=full_messages)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
 
-            suffix = copy.deepcopy(input_value[len(session.input_items):])
+            request_signature = _request_signature(body)
+            if session.output_items and session.last_request_signature == request_signature:
+                return ContinuationPlan(
+                    key=key,
+                    generation=session.generation,
+                    continued=True,
+                    replayed=True,
+                    output_items=copy.deepcopy(session.output_items),
+                    response_id=session.response_id,
+                    usage=copy.deepcopy(session.usage),
+                    canonical_input_items=copy.deepcopy(session.input_items),
+                    prior_output_items=copy.deepcopy(session.output_items),
+                )
+
+            prefix_length = _prefix_length(input_value, session.input_items)
+            previous_response_id = _previous_response_id(body)
+            if prefix_length is not None:
+                suffix = copy.deepcopy(input_value[prefix_length:])
+                canonical_input_items = copy.deepcopy(input_value)
+            elif previous_response_id and previous_response_id == session.response_id:
+                # Codex may send only the new tool call/result items and link them
+                # to the prior response instead of replaying the entire input.
+                overlap = _longest_history_overlap(session.input_items, input_value)
+                suffix = copy.deepcopy(input_value[overlap:])
+                canonical_input_items = copy.deepcopy(session.input_items) + copy.deepcopy(input_value[overlap:])
+            elif session.session_id and session_id and session.session_id == session_id:
+                # Some Codex builds omit previous_response_id but keep a stable
+                # client session. Treat the request as a delta rather than
+                # dropping the task context when its input is shorter.
+                overlap = _longest_history_overlap(session.input_items, input_value)
+                suffix = copy.deepcopy(input_value[overlap:])
+                canonical_input_items = copy.deepcopy(session.input_items) + copy.deepcopy(input_value[overlap:])
+            else:
+                self._sessions.pop(key, None)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
+
             suffix, replayed_items = _drop_replayed_output_items(suffix, session.output_items)
             if not suffix:
                 if (not turn_id or turn_id == session.turn_id) and session.output_items:
@@ -199,9 +321,15 @@ class _SessionStore:
                         output_items=copy.deepcopy(session.output_items),
                         response_id=session.response_id,
                         usage=copy.deepcopy(session.usage),
+                        canonical_input_items=canonical_input_items,
+                        prior_output_items=copy.deepcopy(session.output_items),
                     )
                 self._sessions.pop(key, None)
-                return ContinuationPlan(key=key, messages=full_messages)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=canonical_input_items,
+                )
 
             previous_tool_keys = {_tool_key(tool) for tool in session.tools}
             current_tool_keys = {_tool_key(tool) for tool in tools}
@@ -210,13 +338,10 @@ class _SessionStore:
                 return ContinuationPlan(key=key, messages=full_messages)
             changed_tools = _changed_tools(session.tools, tools)
             messages = codex_tool_bridge.controller_tool_messages(changed_tools)
-            messages.extend(codex_tool_bridge.controller_task_anchor_messages(session.input_items))
-            seed_calls = {
-                str(item.get("call_id") or ""): item
-                for item in replayed_items
-                if str(item.get("type") or "") in codex_tool_bridge.TOOL_CALL_TYPES
-                and str(item.get("call_id") or "")
-            }
+            messages.extend(codex_tool_bridge.controller_task_contract_messages(canonical_input_items))
+            messages.extend(codex_tool_bridge.controller_task_anchor_messages(canonical_input_items))
+            seed_calls = _tool_call_seed(session.output_items)
+            seed_calls.update(_tool_call_seed(replayed_items))
             messages.extend(codex_tool_bridge.controller_transcript_messages({"input": suffix}, seed_calls=seed_calls))
             messages.extend(codex_tool_bridge.controller_turn_state_messages(force_tool))
             if not messages:
@@ -237,6 +362,8 @@ class _SessionStore:
                 access_token=access_token,
                 continued=True,
                 delta_input_items=len(suffix),
+                canonical_input_items=canonical_input_items,
+                prior_output_items=copy.deepcopy(session.output_items),
             )
 
     def commit(
@@ -253,28 +380,30 @@ class _SessionStore:
         usage: dict[str, Any],
     ) -> bool:
         input_value = body.get("input")
-        if (
-            not plan.key
-            or not isinstance(input_value, list)
-            or not conversation_id
-            or not parent_message_id
-            or not access_token
-        ):
+        if not isinstance(input_value, list) or not conversation_id or not parent_message_id or not access_token:
             return False
+        key = plan.key or _session_key(body) or (f"response:{response_id}" if response_id else "")
+        if not key:
+            return False
+        canonical_input_items = (
+            copy.deepcopy(plan.canonical_input_items)
+            if plan.canonical_input_items
+            else copy.deepcopy(input_value)
+        )
         now = time.monotonic()
         metadata = _client_metadata(body)
         with self._lock:
             self._expire_locked(now)
-            current = self._sessions.get(plan.key)
+            current = self._sessions.get(key)
             if plan.continued and (current is None or current.generation != plan.generation):
                 return False
             generation = (current.generation + 1) if current is not None else 1
-            self._sessions[plan.key] = _Session(
+            self._sessions[key] = _Session(
                 generation=generation,
                 model=_model_signature(body.get("model")),
                 instructions_signature=_json_signature(body.get("instructions")),
                 tools=copy.deepcopy(tools),
-                input_items=copy.deepcopy(input_value),
+                input_items=canonical_input_items,
                 output_items=copy.deepcopy(output_items),
                 conversation_id=conversation_id,
                 parent_message_id=parent_message_id,
@@ -283,11 +412,19 @@ class _SessionStore:
                 usage=copy.deepcopy(usage),
                 session_id=str(metadata.get("session_id") or "").strip(),
                 turn_id=str(metadata.get("turn_id") or "").strip(),
+                last_request_signature=_request_signature(body),
                 updated_at=now,
             )
-            self._sessions.move_to_end(plan.key)
+            self._sessions.move_to_end(key)
+            if response_id:
+                self._response_keys[response_id] = key
             while len(self._sessions) > SESSION_MAX_ENTRIES:
-                self._sessions.popitem(last=False)
+                removed_key, _removed = self._sessions.popitem(last=False)
+                self._response_keys = {
+                    response: mapped_key
+                    for response, mapped_key in self._response_keys.items()
+                    if mapped_key != removed_key
+                }
             return True
 
     def invalidate(self, plan: ContinuationPlan) -> None:
@@ -299,6 +436,11 @@ class _SessionStore:
                 not plan.continued or current.generation == plan.generation
             ):
                 self._sessions.pop(plan.key, None)
+                self._response_keys = {
+                    response: mapped_key
+                    for response, mapped_key in self._response_keys.items()
+                    if mapped_key != plan.key
+                }
 
     def _expire_locked(self, now: float) -> None:
         expired = [
