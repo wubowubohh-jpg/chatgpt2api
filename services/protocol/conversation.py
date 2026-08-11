@@ -167,6 +167,15 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def normalize_message_role(role: object, default: str = "user") -> str:
+    """Map OpenAI's developer role to the system role accepted by Web conversations."""
+    value = role if role is not None else default
+    normalized = str(value).strip()
+    if normalized.lower() == "developer":
+        return "system"
+    return normalized or default
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
     normalized = []
     if config.global_system_prompt:
@@ -178,7 +187,7 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            role = message.get("role", "user")
+            role = normalize_message_role(message.get("role", "user"))
             content = message.get("content", "")
             text = message_text(content)
             images: list[tuple[bytes, str]] = []

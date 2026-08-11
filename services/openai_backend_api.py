@@ -440,6 +440,8 @@ class OpenAIBackendAPI:
         conversation_messages = []
         for item in messages:
             role = item.get("role", "user")
+            if str(role or "").strip().lower() == "developer":
+                role = "system"
             content = item.get("content", "")
             if isinstance(content, str):
                 conversation_messages.append({

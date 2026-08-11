@@ -408,6 +408,26 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("cannot execute local tools", str(messages[0]["content"]))
 
+    def test_responses_developer_messages_are_mapped_to_system(self) -> None:
+        _model, messages = openai_v1_response.text_response_parts({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer instruction"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            ],
+        })
+
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertEqual(messages[0]["content"], "developer instruction")
+
     def test_responses_web_search_tool_returns_search_output(self) -> None:
         search_result = {
             "answer": "Latest answer.",
