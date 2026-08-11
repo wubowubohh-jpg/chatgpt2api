@@ -235,13 +235,21 @@ def responses_sse_stream(items) -> Iterator[str]:
                 error_value = {}
             message = str(error_value.get("message") or str(exc) or "response generation failed")
             code = str(error_value.get("code") or "upstream_error")
+            error_type = str(error_value.get("type") or "server_error")
+            if isinstance(exc, UpstreamHTTPError) and exc.status_code == 413:
+                code = "context_length_exceeded"
+                error_type = "invalid_request_error"
+                message = (
+                    "The Codex compatibility request is larger than the ChatGPT Web conversation "
+                    "endpoint accepts. Start a new turn or reduce non-instruction tool output."
+                )
             failed_response = {
                 "id": str(response.get("id") or f"resp_{uuid.uuid4().hex}"),
                 "object": "response",
                 "created_at": int(response.get("created_at") or time.time()),
                 "status": "failed",
                 "error": {
-                    "type": str(error_value.get("type") or "server_error"),
+                    "type": error_type,
                     "code": code,
                     "message": message,
                 },

@@ -7,7 +7,7 @@ from unittest import mock
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import codex_tool_bridge, openai_v1_response
-from utils.helper import responses_sse_stream
+from utils.helper import UpstreamHTTPError, responses_sse_stream
 
 
 EXEC_TOOL = {
@@ -101,8 +101,10 @@ class CodexToolBridgeTests(unittest.TestCase):
 
         _model, messages = openai_v1_response.text_response_parts(body)
 
-        self.assertEqual([message["role"] for message in messages], ["system", "user"])
-        self.assertEqual(messages[1]["content"].count("<environment_context>"), 2)
+        transcript = "\n".join(message["content"] for message in messages if message["role"] == "user")
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(transcript.count("<environment_context>"), 2)
+        self.assertEqual(sum(message["content"].endswith(environment) for message in messages), 2)
         self.assertIn("MUST select a local inspection executor action", messages[0]["content"])
 
         backend = OpenAIBackendAPI()
@@ -110,8 +112,65 @@ class CodexToolBridgeTests(unittest.TestCase):
             payload = backend._conversation_payload(messages, "gpt-5.6-luna", "Asia/Shanghai")
         finally:
             backend.close()
-        self.assertEqual([item["author"]["role"] for item in payload["messages"]], ["system", "user"])
-        self.assertEqual(payload["messages"][1]["content"]["parts"][0].count("<environment_context>"), 2)
+        payload_text = "\n".join(item["content"]["parts"][0] for item in payload["messages"])
+        self.assertEqual(payload_text.count("<environment_context>"), 2)
+        self.assertEqual(sum(item["content"]["parts"][0].endswith(environment) for item in payload["messages"]), 2)
+
+    def test_large_exec_catalog_is_bounded_without_compacting_instruction_records(self) -> None:
+        repeated_instruction = "<environment_context><cwd>C:\\project</cwd></environment_context>\n" + ("rule\n" * 5000)
+        large_exec = {
+            **EXEC_TOOL,
+            "description": "\n\n".join([
+                "Run raw JavaScript through the V8 controller.",
+                "### `shell_command`\nRuns PowerShell commands.\n" + ("shell details " * 900),
+                "### `apply_patch`\nEdits files.\n" + ("patch details " * 900),
+                "### `rare_remote_tool`\nRare remote operation.\n" + ("remote details " * 4000),
+            ]),
+        }
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [large_exec]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": repeated_instruction}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": repeated_instruction}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read the current project"}]},
+        )
+
+        tools = codex_tool_bridge.response_client_tools(body)
+        messages = codex_tool_bridge.controller_messages(body, tools, force_tool=True)
+        all_text = "\n".join(message["content"] for message in messages)
+
+        for item_index in (1, 2):
+            reconstructed = "".join(
+                message["content"].split("\n", 1)[1]
+                for message in messages
+                if message["content"].startswith(f"CODEX_INPUT_RECORD index={item_index} ")
+            )
+            self.assertEqual(reconstructed, repeated_instruction)
+        self.assertIn("shell_command", all_text)
+        self.assertIn("rare_remote_tool", all_text)
+        self.assertIn("ALL_TOOLS", all_text)
+        self.assertLessEqual(
+            max(len(message["content"].encode("utf-8")) for message in messages),
+            codex_tool_bridge.CONTROLLER_RECORD_MAX_BYTES + 256,
+        )
+        legacy_messages = [
+            {"role": "system", "content": codex_tool_bridge.controller_prompt(tools, force_tool=True)},
+            {
+                "role": "user",
+                "content": "CODEX_REQUEST_TRANSCRIPT_DATA\n" + json.dumps(
+                    {"request_transcript": body},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            },
+        ]
+        backend = OpenAIBackendAPI()
+        try:
+            current_payload = backend._conversation_payload(messages, "gpt-5.6-luna", "Asia/Shanghai")
+            legacy_payload = backend._conversation_payload(legacy_messages, "gpt-5.6-luna", "Asia/Shanghai")
+        finally:
+            backend.close()
+        wire_size = lambda payload: len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertLess(wire_size(current_payload), wire_size(legacy_payload) * 0.65)
 
     def test_namespace_function_action_emits_codex_wire_item(self) -> None:
         body = codex_body(
@@ -495,7 +554,7 @@ class CodexToolBridgeTests(unittest.TestCase):
 
         _model, messages = openai_v1_response.text_response_parts(body)
 
-        transcript = messages[1]["content"]
+        transcript = "\n".join(message["content"] for message in messages)
         self.assertIn('"type": "custom_tool_call"', transcript)
         self.assertIn('"type": "custom_tool_call_output"', transcript)
         self.assertEqual(transcript.count('"call_id": "call_1"'), 2)
@@ -610,6 +669,19 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertEqual(decoded[-1]["response"]["id"], "resp_test")
         self.assertIn("upstream 422", decoded[-1]["response"]["error"]["message"])
         self.assertFalse(any(item["type"] == "response.completed" for item in decoded))
+
+    def test_responses_stream_marks_upstream_413_as_non_retryable_context_error(self) -> None:
+        def oversized_stream():
+            yield openai_v1_response.response_created("resp_large", "gpt-5.6-luna", 1)
+            raise UpstreamHTTPError("/backend-api/conversation", 413, "")
+
+        payloads = [chunk for chunk in responses_sse_stream(oversized_stream()) if chunk.startswith("data:")]
+        decoded = [json.loads(chunk[5:].strip()) for chunk in payloads if "[DONE]" not in chunk]
+        error = decoded[-1]["response"]["error"]
+
+        self.assertEqual(decoded[-1]["type"], "response.failed")
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["code"], "context_length_exceeded")
 
 
 if __name__ == "__main__":

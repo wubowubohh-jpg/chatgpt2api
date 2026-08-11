@@ -493,8 +493,8 @@ class ChatCompletionCacheTests(unittest.TestCase):
             ],
         })
 
-        self.assertEqual([message["role"] for message in messages], ["system", "user"])
-        self.assertIn("read README.md", messages[-1]["content"])
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("read README.md", "\n".join(message["content"] for message in messages))
         self.assertIn("action controller", messages[0]["content"])
         self.assertIn('"name": "exec"', messages[0]["content"])
         self.assertNotIn("cannot execute local tools", "\n".join(str(item.get("content")) for item in messages))
@@ -510,12 +510,13 @@ class ChatCompletionCacheTests(unittest.TestCase):
             ],
         })
 
-        self.assertEqual([message["role"] for message in messages], ["system", "user"])
-        self.assertIn('"type": "custom_tool_call"', messages[1]["content"])
-        self.assertIn('"type": "custom_tool_call_output"', messages[1]["content"])
-        self.assertIn('"call_id": "call_1"', messages[1]["content"])
-        self.assertIn("Get-ChildItem", messages[1]["content"])
-        self.assertIn("README.md", messages[1]["content"])
+        transcript = "\n".join(message["content"] for message in messages)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn('"type": "custom_tool_call"', transcript)
+        self.assertIn('"type": "custom_tool_call_output"', transcript)
+        self.assertIn('"call_id": "call_1"', transcript)
+        self.assertIn("Get-ChildItem", transcript)
+        self.assertIn("README.md", transcript)
 
     def test_responses_custom_tool_call_events_are_codex_compatible(self) -> None:
         body = {

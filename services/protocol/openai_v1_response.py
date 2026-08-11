@@ -38,6 +38,7 @@ from utils.image_tokens import (
     image_usage,
     token_usage,
 )
+from utils.log import logger
 
 TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "This compatibility backend cannot execute local tools, shell commands, non-search tools, "
@@ -430,6 +431,25 @@ def _client_tool_events(calls: list[dict[str, Any]], output_index: int) -> tuple
     return events, items
 
 
+def _log_controller_request_shape(
+    messages: list[dict[str, Any]],
+    *,
+    tool_count: int,
+    attempt: str,
+) -> None:
+    contents = [str(message.get("content") or "") for message in messages]
+    encoded_sizes = [len(content.encode("utf-8")) for content in contents]
+    logger.debug({
+        "event": "codex_controller_request_shape",
+        "attempt": attempt,
+        "message_count": len(messages),
+        "tool_count": tool_count,
+        "content_bytes": sum(encoded_sizes),
+        "max_message_bytes": max(encoded_sizes, default=0),
+        "max_message_chars": max((len(content) for content in contents), default=0),
+    })
+
+
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
@@ -450,6 +470,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
             client_tools,
             force_tool=force_tool,
         )
+        _log_controller_request_shape(controller_messages, tool_count=len(client_tools), attempt="initial")
         request = ConversationRequest(model=model, messages=controller_messages, thinking_effort=thinking_effort)
         for delta in stream_text_deltas(backend, request):
             full_text += delta
@@ -473,6 +494,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                 force_tool=force_tool,
                 invalid_output=full_text,
             )
+            _log_controller_request_shape(repair_messages, tool_count=len(client_tools), attempt="repair")
             repair_request = ConversationRequest(model=model, messages=repair_messages, thinking_effort=thinking_effort)
             for delta in stream_text_deltas(backend, repair_request):
                 repaired_text += delta
