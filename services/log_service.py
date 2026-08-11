@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
 from services.protocol.error_response import anthropic_error_response, openai_error_response
-from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.helper import anthropic_sse_stream, responses_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
@@ -248,7 +248,12 @@ class LoggedCall:
             response.pop("_account_email", None)
             return response
 
-        sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
+        if sse == "anthropic":
+            sender = anthropic_sse_stream
+        elif sse == "responses":
+            sender = responses_sse_stream
+        else:
+            sender = sse_json_stream
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:

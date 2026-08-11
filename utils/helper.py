@@ -209,6 +209,69 @@ def sse_json_stream(items) -> Iterator[str]:
     yield "data: [DONE]\n\n"
 
 
+def responses_sse_stream(items) -> Iterator[str]:
+    yield ": stream-open\n\n"
+    response: dict[str, Any] = {}
+    terminal = False
+    try:
+        for item in items:
+            if isinstance(item, dict):
+                event_type = str(item.get("type") or "")
+                if event_type == "response.created" and isinstance(item.get("response"), dict):
+                    response = dict(item["response"])
+                if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                    terminal = True
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.warning({
+            "event": "responses_sse_stream_error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        })
+        if not terminal:
+            public_error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {}
+            error_value = public_error.get("error") if isinstance(public_error, dict) else {}
+            if not isinstance(error_value, dict):
+                error_value = {}
+            message = str(error_value.get("message") or str(exc) or "response generation failed")
+            code = str(error_value.get("code") or "upstream_error")
+            failed_response = {
+                "id": str(response.get("id") or f"resp_{uuid.uuid4().hex}"),
+                "object": "response",
+                "created_at": int(response.get("created_at") or time.time()),
+                "status": "failed",
+                "error": {
+                    "type": str(error_value.get("type") or "server_error"),
+                    "code": code,
+                    "message": message,
+                },
+                "incomplete_details": None,
+                "model": response.get("model"),
+                "output": [],
+            }
+            event = {"type": "response.failed", "response": failed_response}
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            terminal = True
+    if not terminal:
+        failed_response = {
+            "id": str(response.get("id") or f"resp_{uuid.uuid4().hex}"),
+            "object": "response",
+            "created_at": int(response.get("created_at") or time.time()),
+            "status": "failed",
+            "error": {
+                "type": "server_error",
+                "code": "stream_ended_without_terminal_event",
+                "message": "response stream ended without a terminal event",
+            },
+            "incomplete_details": None,
+            "model": response.get("model"),
+            "output": [],
+        }
+        event = {"type": "response.failed", "response": failed_response}
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def anthropic_sse_stream(items) -> Iterator[str]:
     try:
         for item in items:

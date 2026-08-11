@@ -453,7 +453,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         model, messages = openai_v1_response.text_response_parts({
             "model": "auto",
             "input": "run echo hi",
-            "tools": [{"type": "function", "name": "shell"}],
+            "tools": [{"type": "computer_use_preview"}],
         })
 
         self.assertEqual(model, "auto")
@@ -493,9 +493,10 @@ class ChatCompletionCacheTests(unittest.TestCase):
             ],
         })
 
-        self.assertEqual(messages[-1], {"role": "user", "content": "read README.md"})
-        self.assertIn("codex_tool_call", messages[0]["content"])
-        self.assertIn("exec (custom)", messages[0]["content"])
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertIn("read README.md", messages[-1]["content"])
+        self.assertIn("action controller", messages[0]["content"])
+        self.assertIn('"name": "exec"', messages[0]["content"])
         self.assertNotIn("cannot execute local tools", "\n".join(str(item.get("content")) for item in messages))
 
     def test_responses_tool_history_is_forwarded_to_web_model(self) -> None:
@@ -509,9 +510,12 @@ class ChatCompletionCacheTests(unittest.TestCase):
             ],
         })
 
-        self.assertEqual([message["role"] for message in messages[1:]], ["user", "assistant", "user"])
-        self.assertIn("Get-ChildItem", messages[2]["content"])
-        self.assertIn("README.md", messages[3]["content"])
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertIn('"type": "custom_tool_call"', messages[1]["content"])
+        self.assertIn('"type": "custom_tool_call_output"', messages[1]["content"])
+        self.assertIn('"call_id": "call_1"', messages[1]["content"])
+        self.assertIn("Get-ChildItem", messages[1]["content"])
+        self.assertIn("README.md", messages[1]["content"])
 
     def test_responses_custom_tool_call_events_are_codex_compatible(self) -> None:
         body = {

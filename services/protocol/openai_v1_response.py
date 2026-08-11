@@ -9,6 +9,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.protocol import codex_tool_bridge
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -43,15 +44,6 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
-
-CODEX_TOOL_PROMPT = """
-The client can execute the tools listed below on the user's machine. If the user asks you to inspect files, run a command, or use one of these tools, you MUST call the tool instead of saying that local access is unavailable.
-
-Emit a tool call using exactly this plain-text format, with no markdown fence or surrounding explanation:
-<codex_tool_call name="TOOL_NAME"><![CDATA[TOOL_INPUT]]></codex_tool_call>
-
-For a custom tool, TOOL_INPUT is the raw input string expected by that tool. For a function tool, TOOL_INPUT is a JSON object containing its arguments. Wait for the tool result before answering the user.
-""".strip()
 
 CODEX_TOOL_CALL_RE = re.compile(
     r"(?is)<(?P<tag>codex_tool_call|custom_tool_call|tool_call)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>"
@@ -94,80 +86,24 @@ def has_unsupported_response_tools(body: dict[str, Any]) -> bool:
     return has_unsupported_tools(body, {"image_generation", *WEB_SEARCH_TOOL_TYPES})
 
 
-def response_client_tools(body: dict[str, Any]) -> list[dict[str, str]]:
-    """Extract client-executed Codex tools from Responses input metadata."""
-    definitions: list[dict[str, str]] = []
-    candidates: list[object] = []
-    input_value = body.get("input")
-    if isinstance(input_value, list):
-        for item in input_value:
-            if isinstance(item, dict) and item.get("type") == "additional_tools":
-                candidates.extend(item.get("tools") or [])
-    for tool in candidates:
-        if not isinstance(tool, dict):
-            continue
-        kind = str(tool.get("type") or "").strip().lower()
-        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
-        name = str(tool.get("name") or function.get("name") or "").strip()
-        if not name or kind not in {"custom", "function"}:
-            continue
-        if any(existing["name"] == name for existing in definitions):
-            continue
-        definitions.append({
-            "name": name,
-            "kind": kind,
-            "description": str(tool.get("description") or function.get("description") or "").strip(),
-        })
-    return definitions
+def response_client_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
+    if str(body.get("tool_choice") or "").strip().lower() == "none":
+        return []
+    return codex_tool_bridge.response_client_tools(body)
 
 
-def client_tool_prompt(tools: list[dict[str, str]]) -> str:
-    lines = [CODEX_TOOL_PROMPT, "", "Available client tools:"]
-    for tool in tools:
-        description = f": {tool['description']}" if tool.get("description") else ""
-        lines.append(f"- {tool['name']} ({tool['kind']}){description}")
-    return "\n".join(lines)
+def client_tool_prompt(tools: list[dict[str, Any]]) -> str:
+    return codex_tool_bridge.controller_prompt(tools)
 
 
-def _response_item_text(value: object) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "".join(_response_item_text(item) for item in value)
-    if isinstance(value, dict):
-        for key in ("text", "output", "content", "input_text"):
-            if key in value:
-                text = _response_item_text(value.get(key))
-                if text:
-                    return text
-    return ""
-
-
-def _tool_history_message(item: dict[str, Any]) -> dict[str, str] | None:
-    item_type = str(item.get("type") or "").strip().lower()
-    if item_type in {"custom_tool_call", "function_call"}:
-        name = str(item.get("name") or "tool").strip() or "tool"
-        raw_input = item.get("input") if item_type == "custom_tool_call" else item.get("arguments")
-        if raw_input is None:
-            raw_input = item.get("arguments") or item.get("input") or ""
-        return {"role": "assistant", "content": f"[tool call: {name}]\n{_response_item_text(raw_input)}"}
-    if item_type in {"custom_tool_call_output", "function_call_output"}:
-        output = _response_item_text(item.get("output") or item.get("content") or "")
-        call_id = str(item.get("call_id") or "").strip()
-        label = f"[tool result{f' {call_id}' if call_id else ''}]"
-        return {"role": "user", "content": f"{label}\n{output}".strip()}
-    return None
-
-
-def parse_client_tool_calls(text: str, tools: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
-    """Parse the deterministic marker emitted by the Web model tool adapter."""
-    known = {tool["name"]: tool["kind"] for tool in tools}
-    calls: list[dict[str, str]] = []
+def parse_client_tool_calls(text: str, tools: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """Parse legacy XML markers through the same validator as JSON actions."""
+    calls: list[dict[str, Any]] = []
     spans: list[tuple[int, int]] = []
     for match in CODEX_TOOL_CALL_RE.finditer(str(text or "")):
         name_match = TOOL_NAME_RE.search(match.group("attrs") or "")
         name = name_match.group(1).strip() if name_match else ""
-        if name not in known:
+        if not name:
             continue
         body = match.group("body") or ""
         input_match = TOOL_INPUT_RE.search(body)
@@ -178,12 +114,14 @@ def parse_client_tool_calls(text: str, tools: list[dict[str, str]]) -> tuple[lis
         raw_input = raw_input.strip()
         if not raw_input:
             continue
-        if known[name] == "function":
-            try:
-                json.loads(raw_input)
-            except json.JSONDecodeError:
-                continue
-        calls.append({"name": name, "kind": known[name], "input": raw_input})
+        legacy_payload = json.dumps(
+            {"action": "tool", "name": name, "input": raw_input},
+            ensure_ascii=False,
+        )
+        action = codex_tool_bridge.parse_controller_action(legacy_payload, tools)
+        if action is None:
+            continue
+        calls.append(action)
         spans.append(match.span())
     visible = str(text or "")
     for start, end in reversed(spans):
@@ -265,6 +203,7 @@ def _append_response_message(messages: list[dict[str, Any]], role: object, conte
 
 def messages_from_input(input_value: object, instructions: object = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
+    tool_calls_by_id: dict[str, dict[str, Any]] = {}
     system_text = str(instructions or "").strip()
     if system_text:
         messages.append({"role": "system", "content": system_text})
@@ -296,7 +235,7 @@ def messages_from_input(input_value: object, instructions: object = None) -> lis
                 pending_parts = []
             if not isinstance(item, dict):
                 continue
-            tool_message = _tool_history_message(item)
+            tool_message = codex_tool_bridge.tool_history_message(item, tool_calls_by_id)
             if tool_message:
                 messages.append(tool_message)
                 continue
@@ -410,11 +349,17 @@ def response_completed(
 
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
     client_tools = response_client_tools(body)
     if client_tools:
-        messages.insert(0, {"role": "system", "content": client_tool_prompt(client_tools)})
-    elif has_unsupported_response_tools(body):
+        force_tool = (
+            codex_tool_bridge.requires_local_tool(body, client_tools)
+            and not codex_tool_bridge.current_turn_has_tool_output(body.get("input"))
+        )
+        return model, codex_tool_bridge.controller_messages(body, client_tools, force_tool=force_tool)
+    messages = normalize_text_messages(
+        normalize_messages(messages_from_input(body.get("input"), body.get("instructions")))
+    )
+    if has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
 
@@ -434,32 +379,52 @@ def _text_output_events(text: str, output_index: int = 0) -> tuple[list[dict[str
     return events, item
 
 
-def _client_tool_events(calls: list[dict[str, str]], output_index: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _client_tool_events(calls: list[dict[str, Any]], output_index: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
     for index, call in enumerate(calls, start=output_index):
-        item_id = f"ctc_{uuid.uuid4().hex}"
         call_id = f"call_{uuid.uuid4().hex}"
-        custom = call["kind"] == "custom"
-        item_type = "custom_tool_call" if custom else "function_call"
+        kind = call["kind"]
+        custom = kind == "custom"
+        tool_search = kind == "tool_search"
+        item_id = f"{'tsc' if tool_search else 'ctc' if custom else 'fc'}_{uuid.uuid4().hex}"
+        item_type = "tool_search_call" if tool_search else "custom_tool_call" if custom else "function_call"
         item = {
             "id": item_id,
             "type": item_type,
             "status": "in_progress",
-            "name": call["name"],
             "call_id": call_id,
-            "input" if custom else "arguments": "",
         }
-        events.append({"type": "response.output_item.added", "output_index": index, "item": item})
-        if custom:
-            events.append({"type": "response.custom_tool_call_input.delta", "item_id": item_id, "output_index": index, "delta": call["input"]})
-            events.append({"type": "response.custom_tool_call_input.done", "item_id": item_id, "output_index": index, "input": call["input"]})
+        namespace = codex_tool_bridge.normalize_namespace(call.get("namespace"))
+        if tool_search:
+            item["execution"] = "client"
+            item["arguments"] = json.loads(call["input"])
         else:
-            events.append({"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": index, "delta": call["input"]})
-            events.append({"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": index, "arguments": call["input"]})
+            item["name"] = call["name"]
+            item["input" if custom else "arguments"] = ""
+            if namespace:
+                item["namespace"] = namespace
+        events.append({"type": "response.output_item.added", "output_index": index, "item": item})
+        if not tool_search:
+            event_prefix = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+            events.append({
+                "type": f"{event_prefix}.delta",
+                "item_id": item_id,
+                "call_id": call_id,
+                "output_index": index,
+                "delta": call["input"],
+            })
+            events.append({
+                "type": f"{event_prefix}.done",
+                "item_id": item_id,
+                "call_id": call_id,
+                "output_index": index,
+                "input" if custom else "arguments": call["input"],
+            })
         completed_item = dict(item)
         completed_item["status"] = "completed"
-        completed_item["input" if custom else "arguments"] = call["input"]
+        if not tool_search:
+            completed_item["input" if custom else "arguments"] = call["input"]
         events.append({"type": "response.output_item.done", "output_index": index, "item": completed_item})
         items.append(completed_item)
     return events, items
@@ -474,33 +439,85 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     created = int(time.time())
     full_text = ""
     yield response_created(response_id, model, created)
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     client_tools = response_client_tools(body)
     if client_tools:
+        force_tool = (
+            codex_tool_bridge.requires_local_tool(body, client_tools)
+            and not codex_tool_bridge.current_turn_has_tool_output(body.get("input"))
+        )
+        controller_messages = codex_tool_bridge.controller_messages(
+            body,
+            client_tools,
+            force_tool=force_tool,
+        )
+        request = ConversationRequest(model=model, messages=controller_messages, thinking_effort=thinking_effort)
         for delta in stream_text_deltas(backend, request):
             full_text += delta
-        calls, visible_text = parse_client_tool_calls(full_text, client_tools)
+        action = codex_tool_bridge.parse_controller_action(full_text, client_tools)
+        legacy_calls, _legacy_visible_text = parse_client_tool_calls(full_text, client_tools)
+        if action is None and legacy_calls:
+            action = {"action": "tool", **legacy_calls[0]}
+        rejected_action = (
+            action is not None
+            and (
+                (action.get("action") == "final" and codex_tool_bridge.is_access_refusal(str(action.get("text") or "")))
+                or (force_tool and not codex_tool_bridge.is_local_executor_action(action))
+            )
+        )
+        invalid_output = action is None
+        if rejected_action or invalid_output:
+            repaired_text = ""
+            repair_messages = codex_tool_bridge.controller_messages(
+                body,
+                client_tools,
+                force_tool=force_tool,
+                invalid_output=full_text,
+            )
+            repair_request = ConversationRequest(model=model, messages=repair_messages, thinking_effort=thinking_effort)
+            for delta in stream_text_deltas(backend, repair_request):
+                repaired_text += delta
+            repaired_action = codex_tool_bridge.parse_controller_action(repaired_text, client_tools)
+            repaired_legacy_calls, _repaired_visible_text = parse_client_tool_calls(repaired_text, client_tools)
+            if repaired_action is None and repaired_legacy_calls:
+                repaired_action = {"action": "tool", **repaired_legacy_calls[0]}
+            repaired_refusal = (
+                repaired_action is not None
+                and repaired_action.get("action") == "final"
+                and codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
+            )
+            if repaired_action is not None and not repaired_refusal:
+                action = repaired_action
+                full_text = repaired_text
+            elif force_tool:
+                action = codex_tool_bridge.bootstrap_local_action(client_tools)
+            else:
+                raise RuntimeError("Codex tool controller could not produce a valid action")
+        if action is None:
+            raise RuntimeError("Codex tool controller returned no action")
+        if force_tool and not codex_tool_bridge.is_local_executor_action(action):
+            action = codex_tool_bridge.bootstrap_local_action(client_tools)
+            if action is None:
+                raise RuntimeError("Codex request requires a local tool, but no local executor is available")
         output: list[dict[str, Any]] = []
-        if visible_text:
+        visible_text = ""
+        if action.get("action") == "final":
+            visible_text = str(action.get("text") or "")
+        if visible_text or action.get("action") == "final":
             text_events, text_item = _text_output_events(visible_text, 0)
             yield from text_events
             output.append(text_item)
-        if calls:
-            tool_events, tool_items = _client_tool_events(calls, len(output))
+        if action.get("action") == "tool":
+            tool_events, tool_items = _client_tool_events([action], len(output))
             yield from tool_events
             output.extend(tool_items)
-        else:
-            if not output:
-                text_events, text_item = _text_output_events(full_text, 0)
-                yield from text_events
-                output.append(text_item)
         usage = token_usage(
-            input_text_tokens=count_message_text_tokens(messages, model),
-            input_image_tokens=count_message_image_tokens(messages, model),
-            output_text_tokens=count_text_tokens(visible_text or full_text, model),
+            input_text_tokens=count_message_text_tokens(controller_messages, model),
+            input_image_tokens=count_message_image_tokens(controller_messages, model),
+            output_text_tokens=count_text_tokens(full_text, model),
         )
         yield response_completed(response_id, model, created, output, usage)
         return
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
     for delta in stream_text_deltas(backend, request):
         full_text += delta

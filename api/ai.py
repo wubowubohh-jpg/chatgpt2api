@@ -12,6 +12,7 @@ from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
+    codex_search,
     openai_v1_chat_complete,
     openai_v1_image_edit,
     openai_v1_image_generations,
@@ -61,6 +62,17 @@ class AnthropicMessageRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
+
+
+class CodexSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str = ""
+    model: str = "auto"
+    reasoning: object | None = None
+    input: object | None = None
+    commands: dict[str, object] | None = None
+    settings: dict[str, object] | None = None
+    max_output_tokens: int | None = Field(default=None, ge=0)
 
 
 class EditableFileTaskRequest(BaseModel):
@@ -150,7 +162,7 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload)
+        return await call.run(openai_v1_response.handle, payload, sse="responses")
 
     @router.post("/v1/messages")
     async def create_message(
@@ -173,6 +185,28 @@ def create_router() -> APIRouter:
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
+
+    @router.post("/alpha/search")
+    @router.post("/v1/alpha/search")
+    async def codex_alpha_search(
+            body: CodexSearchRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        payload = body.model_dump(mode="python")
+        prompt = codex_search.request_prompt(payload)
+        request_preview = prompt or "empty Codex search command"
+        call = LoggedCall(
+            identity,
+            request.url.path,
+            body.model or "auto",
+            "Codex Search",
+            request_text=request_preview,
+        )
+        if prompt:
+            await filter_or_log(call, prompt)
+        return await call.run(codex_search.handle, payload, str(identity.get("id") or ""))
 
     @router.get("/v1/editable-file-tasks")
     async def list_editable_file_tasks(ids: str = "", authorization: str | None = Header(default=None)):
