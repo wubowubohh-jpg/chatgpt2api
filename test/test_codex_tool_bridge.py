@@ -826,7 +826,8 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertIn("custom_tool_call_output", continuation_text)
         self.assertIn("README.md", continuation_text)
         self.assertNotIn(environment, continuation_text)
-        self.assertNotIn("read the current project", continuation_text)
+        self.assertIn("CODEX_TASK_ANCHOR original_user_request", continuation_text)
+        self.assertIn("read the current project", continuation_text)
         self.assertIn("force_local_tool=false", continuation_text)
         final_output = second_events[-1]["response"]["output"][0]
         self.assertEqual(final_output["content"][0]["text"], "README.md is present")

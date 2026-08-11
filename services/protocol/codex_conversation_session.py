@@ -210,6 +210,7 @@ class _SessionStore:
                 return ContinuationPlan(key=key, messages=full_messages)
             changed_tools = _changed_tools(session.tools, tools)
             messages = codex_tool_bridge.controller_tool_messages(changed_tools)
+            messages.extend(codex_tool_bridge.controller_task_anchor_messages(session.input_items))
             seed_calls = {
                 str(item.get("call_id") or ""): item
                 for item in replayed_items
