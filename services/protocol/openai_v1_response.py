@@ -47,9 +47,9 @@ RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url",
 
 def normalize_thinking_effort(value: object) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized in {"", "none"}:
+    if normalized in {"", "none", "auto"}:
         return ""
-    if normalized in {"low", "medium", "high"}:
+    if normalized in {"low", "medium", "high", "standard", "max"}:
         return normalized
     if normalized in {"xhigh", "extended"}:
         return "extended"

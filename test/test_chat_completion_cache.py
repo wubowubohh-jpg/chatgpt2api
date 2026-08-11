@@ -6,6 +6,7 @@ import json
 import base64
 
 from services.config import config
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
@@ -119,6 +120,57 @@ class ChatCompletionCacheTests(unittest.TestCase):
             openai_v1_response.handle(body)
 
         self.assertEqual(captured_efforts, ["extended"])
+
+    def test_web_payload_maps_openai_reasoning_efforts(self) -> None:
+        expected = {
+            "low": "standard",
+            "medium": "standard",
+            "high": "extended",
+            "xhigh": "extended",
+            "max": "max",
+        }
+        backend = OpenAIBackendAPI(access_token="")
+        try:
+            for effort, web_effort in expected.items():
+                with self.subTest(effort=effort):
+                    payload = backend._conversation_payload(
+                        [{"role": "user", "content": "hi"}],
+                        "gpt-5-6-luna",
+                        "Asia/Shanghai",
+                        thinking_effort=effort,
+                    )
+                    self.assertEqual(payload["thinking_effort"], web_effort)
+        finally:
+            backend.close()
+
+    def test_web_payload_preserves_repeated_codex_context(self) -> None:
+        messages = []
+        for index in range(8):
+            messages.append({"role": "system", "content": "repeated codex instructions"})
+            if index < 7:
+                messages.append({"role": "user", "content": "<environment_context>same context</environment_context>"})
+        messages.extend([
+            {"role": "user", "content": "first request"},
+            {"role": "user", "content": "latest request"},
+        ])
+
+        backend = OpenAIBackendAPI(access_token="")
+        try:
+            payload = backend._conversation_payload(
+                messages,
+                "gpt-5-6-luna",
+                "Asia/Shanghai",
+                thinking_effort="medium",
+            )
+        finally:
+            backend.close()
+
+        self.assertEqual(payload["thinking_effort"], "standard")
+        self.assertEqual(len(payload["messages"]), len(messages))
+        self.assertEqual(
+            [item["content"]["parts"][0] for item in payload["messages"]],
+            [item["content"] for item in messages],
+        )
 
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0
