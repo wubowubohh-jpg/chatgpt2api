@@ -450,6 +450,36 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertIn("tools.shell_command", item["input"])
         self.assertIn("Get-ChildItem -Force", item["input"])
 
+    def test_local_repair_plan_is_replaced_with_exec(self) -> None:
+        """A prose plan cannot terminate a turn that requires local execution."""
+        environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [EXEC_TOOL]},
+            ]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": environment}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read the current project"}]},
+        )
+        outputs = iter([
+            '{"action":"final","text":"I will analyze the project first."}',
+            '{"action":"final","text":"I will inspect the files and continue."}',
+        ])
+
+        def fake_stream(_backend, _request):
+            yield next(outputs)
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream) as stream,
+        ):
+            events = list(openai_v1_response.handle(body))
+
+        self.assertEqual(stream.call_count, 2)
+        item = next(event["item"] for event in events if event["type"] == "response.output_item.done")
+        self.assertEqual(item["type"], "custom_tool_call")
+        self.assertEqual(item["name"], "exec")
+        self.assertIn("Get-ChildItem -Force", item["input"])
+
     def test_plain_shell_text_is_rejected_as_exec_javascript(self) -> None:
         tools = codex_tool_bridge.response_client_tools(codex_body(
             {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},

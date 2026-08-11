@@ -728,7 +728,12 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                         and repaired_action.get("action") == "final"
                         and codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
                     )
-                    if repaired_action is not None and not repaired_refusal:
+                    repaired_force_tool_rejection = (
+                        force_tool
+                        and repaired_action is not None
+                        and not codex_tool_bridge.is_local_executor_action(repaired_action)
+                    )
+                    if repaired_action is not None and not repaired_refusal and not repaired_force_tool_rejection:
                         action = repaired_action
                         full_text = repaired_text
                         request = repair_request
