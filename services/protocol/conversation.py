@@ -14,6 +14,7 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
+from services.model_service import normalize_model_identifier
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
@@ -680,6 +681,18 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         yield conversation_base_event("conversation.event", state, raw=event)
 
 
+def upstream_model_identifier(model: str) -> str:
+    """Use the catalog slug for GPT version aliases while preserving public names."""
+    requested = str(model or "").strip() or "auto"
+    normalized = requested.lower()
+    if not normalized.startswith("gpt-") or normalize_model_identifier(normalized) == normalized:
+        return requested
+    canonical = normalize_model_identifier(normalized)
+    from services.model_service import model_catalog_service
+
+    return model_catalog_service.resolve_model(requested) or canonical
+
+
 def conversation_events(
     backend: OpenAIBackendAPI,
     messages: list[dict[str, Any]] | None = None,
@@ -692,12 +705,13 @@ def conversation_events(
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
+    upstream_model = model if image_model else upstream_model_identifier(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
     final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
-        model=model,
+        model=upstream_model,
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,

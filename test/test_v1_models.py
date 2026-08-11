@@ -14,6 +14,56 @@ BASE_URL = "http://localhost:8000"
 
 
 class ModelListTests(unittest.TestCase):
+    def test_list_models_exposes_dotted_aliases_for_separate_5_6_models(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "list_models",
+                return_value={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-5-6", "object": "model", "root": "gpt-5-6"},
+                        {"id": "gpt-5-6-luna", "object": "model", "root": "gpt-5-6-luna"},
+                    ],
+                },
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[],
+            ),
+        ):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertEqual(
+            ids,
+            {"gpt-5-6", "gpt-5.6", "gpt-5-6-luna", "gpt-5.6-luna"},
+        )
+
+    def test_list_models_adds_separate_luna_passthrough_for_5_6_family(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "list_models",
+                return_value={
+                    "object": "list",
+                    "data": [{"id": "gpt-5-6", "object": "model", "root": "gpt-5-6"}],
+                },
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[],
+            ),
+        ):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("gpt-5.6", ids)
+        self.assertIn("gpt-5-6-luna", ids)
+        self.assertIn("gpt-5.6-luna", ids)
+
     def test_list_models_only_returns_image_models_backed_by_account_types(self):
         with (
             mock.patch.object(

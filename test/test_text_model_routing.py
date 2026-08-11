@@ -105,6 +105,40 @@ class TextProtocolRoutingTests(unittest.TestCase):
 
         backend.assert_called_once_with("pro-chat")
 
+    def test_dotted_luna_name_uses_hyphenated_catalog_slug_upstream(self) -> None:
+        backend = mock.Mock()
+        backend.stream_conversation.return_value = iter(["[DONE]"])
+        with mock.patch(
+            "services.model_service.model_catalog_service.resolve_model",
+            return_value="gpt-5-6-luna",
+        ) as resolver:
+            list(conversation.conversation_events(
+                backend,
+                model="gpt-5.6-luna",
+                prompt="hello",
+            ))
+
+        resolver.assert_called_once_with("gpt-5.6-luna")
+        self.assertEqual(
+            backend.stream_conversation.call_args.kwargs["model"],
+            "gpt-5-6-luna",
+        )
+
+    def test_hyphenated_luna_name_is_forwarded_unchanged(self) -> None:
+        backend = mock.Mock()
+        backend.stream_conversation.return_value = iter(["[DONE]"])
+
+        list(conversation.conversation_events(
+            backend,
+            model="gpt-5-6-luna",
+            prompt="hello",
+        ))
+
+        self.assertEqual(
+            backend.stream_conversation.call_args.kwargs["model"],
+            "gpt-5-6-luna",
+        )
+
     def test_responses_passes_requested_model_to_text_backend(self) -> None:
         body = {"model": "pro-response", "input": "route response"}
         with (

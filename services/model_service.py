@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -16,10 +17,84 @@ from utils.log import logger
 class ModelRoute:
     account_types: frozenset[str]
     allow_anonymous: bool = False
+    resolved_model: str = ""
 
 
 class ModelUnavailableError(RuntimeError):
     pass
+
+
+_GPT_VERSION_RE = re.compile(r"^(gpt-\d+)\.(\d+)(?=$|-)", re.IGNORECASE)
+_GPT_VERSION_CANONICAL_RE = re.compile(r"^(gpt-\d+)-(\d+)(?=$|-)", re.IGNORECASE)
+_MODEL_ROUTE_FAMILY_HINTS = {
+    "gpt-5-6-luna": ("gpt-5-6",),
+}
+
+
+def normalize_model_identifier(model: object) -> str:
+    """Normalize GPT version punctuation without changing the model family."""
+    value = str(model or "").strip().lower()
+    return _GPT_VERSION_RE.sub(r"\1-\2", value, count=1)
+
+
+def _dotted_model_identifier(model: str) -> str:
+    return _GPT_VERSION_CANONICAL_RE.sub(r"\1.\2", model, count=1)
+
+
+def resolve_model_identifier(model: object, available_model_ids: list[str] | tuple[str, ...] | set[str]) -> str:
+    """Return the real catalog id matching a request spelling, or an empty string."""
+    requested = str(model or "").strip()
+    if not requested:
+        return ""
+    exact_key = requested.lower()
+    normalized_ids: dict[str, str] = {}
+    exact_ids: dict[str, str] = {}
+    for model_id in available_model_ids:
+        candidate = str(model_id or "").strip()
+        if not candidate:
+            continue
+        exact_ids.setdefault(candidate.lower(), candidate)
+        normalized_ids.setdefault(normalize_model_identifier(candidate), candidate)
+    if exact_key in exact_ids:
+        return exact_ids[exact_key]
+    return normalized_ids.get(normalize_model_identifier(requested), "")
+
+
+def model_compatibility_entries(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build compatible public names without changing their upstream model slug."""
+    by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in models
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    entries: list[dict[str, Any]] = []
+    seen = set(by_id)
+
+    def append_entry(model_id: str, source: dict[str, Any]) -> None:
+        if model_id in seen:
+            return
+        entry = dict(source)
+        entry["id"] = model_id
+        entry["root"] = model_id
+        entry["parent"] = None
+        entry["owned_by"] = "chatgpt2api"
+        entries.append(entry)
+        seen.add(model_id)
+
+    for model_id, item in by_id.items():
+        normalized = normalize_model_identifier(model_id)
+        if not normalized.startswith("gpt-") or normalized != model_id.lower():
+            continue
+        alias = _dotted_model_identifier(normalized)
+        if alias != model_id.lower():
+            append_entry(alias, item)
+
+    base_model = resolve_model_identifier("gpt-5-6", set(by_id))
+    luna_model = resolve_model_identifier("gpt-5-6-luna", set(by_id))
+    if base_model and not luna_model:
+        append_entry("gpt-5-6-luna", by_id[base_model])
+        append_entry("gpt-5.6-luna", by_id[base_model])
+    return sorted(entries, key=lambda item: str(item.get("id") or ""))
 
 
 class ModelCatalogService:
@@ -164,18 +239,44 @@ class ModelCatalogService:
             "data": [union[model_id] for model_id in sorted(union)],
         }
 
-    def route_for_model(self, model: str) -> ModelRoute:
-        model = str(model or "").strip()
+    def resolve_model(self, model: str) -> str:
         self._ensure_catalog()
         with self._lock:
+            model_ids = set(self._anonymous_models)
+            for models in self._models_by_account_type.values():
+                model_ids.update(models)
+            resolved_model = resolve_model_identifier(model, model_ids)
+            if resolved_model:
+                return resolved_model
+            normalized_model = normalize_model_identifier(model)
+            if any(
+                resolve_model_identifier(hint, model_ids)
+                for hint in _MODEL_ROUTE_FAMILY_HINTS.get(normalized_model, ())
+            ):
+                return normalized_model
+            return ""
+
+    def route_for_model(self, model: str) -> ModelRoute:
+        resolved_model = self.resolve_model(model)
+        if not resolved_model:
+            return ModelRoute(account_types=frozenset(), allow_anonymous=False)
+        with self._lock:
+            directly_advertised = (
+                resolved_model in self._anonymous_models
+                or any(resolved_model in models for models in self._models_by_account_type.values())
+            )
+            route_models = {resolved_model}
+            if not directly_advertised:
+                route_models.update(_MODEL_ROUTE_FAMILY_HINTS.get(resolved_model, ()))
             account_types = frozenset(
                 account_type
                 for account_type, models in self._models_by_account_type.items()
-                if model in models
+                if route_models.intersection(models)
             )
             return ModelRoute(
                 account_types=account_types,
-                allow_anonymous=model in self._anonymous_models,
+                allow_anonymous=bool(route_models.intersection(self._anonymous_models)),
+                resolved_model=resolved_model,
             )
 
 

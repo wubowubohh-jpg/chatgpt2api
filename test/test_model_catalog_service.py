@@ -109,6 +109,34 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("pro"), 1)
         self.assertEqual(self.calls.count(""), 1)
 
+    def test_dotted_gpt_versions_route_to_independent_hyphenated_models(self) -> None:
+        self.outcomes["free-good"] = model_list("gpt-5-6")
+        self.outcomes["plus"] = model_list("gpt-5-6-luna")
+
+        base_route = self.catalog.route_for_model("gpt-5.6")
+        luna_route = self.catalog.route_for_model("gpt-5.6-luna")
+
+        self.assertEqual(base_route.resolved_model, "gpt-5-6")
+        self.assertEqual(base_route.account_types, frozenset({"free"}))
+        self.assertEqual(luna_route.resolved_model, "gpt-5-6-luna")
+        self.assertEqual(luna_route.account_types, frozenset({"Plus"}))
+        self.assertEqual(
+            self.catalog.route_for_model("gpt-5-6-luna").resolved_model,
+            "gpt-5-6-luna",
+        )
+        self.assertEqual(
+            self.catalog.route_for_model("gpt-5.6-terra").account_types,
+            frozenset(),
+        )
+
+    def test_hidden_luna_slug_uses_base_family_only_to_select_an_account(self) -> None:
+        self.outcomes["free-good"] = model_list("gpt-5-6")
+
+        luna_route = self.catalog.route_for_model("gpt-5.6-luna")
+
+        self.assertEqual(luna_route.resolved_model, "gpt-5-6-luna")
+        self.assertEqual(luna_route.account_types, frozenset({"free"}))
+
     def test_concurrent_readers_share_one_catalog_refresh(self) -> None:
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(lambda _index: self.catalog.list_models(), range(8)))

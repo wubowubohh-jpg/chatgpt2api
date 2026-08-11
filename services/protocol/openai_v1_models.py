@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
-from services.model_service import model_catalog_service
+from services.model_service import model_catalog_service, model_compatibility_entries
 from utils.helper import CODEX_IMAGE_MODEL
 
 
@@ -13,6 +13,11 @@ def list_models() -> dict[str, Any]:
     if not isinstance(data, list):
         return result
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
+    for alias_item in model_compatibility_entries(data):
+        alias = str(alias_item.get("id") or "").strip()
+        if alias and alias not in seen:
+            data.append(alias_item)
+            seen.add(alias)
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()
     web_image_accounts = [
