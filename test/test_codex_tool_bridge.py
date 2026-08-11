@@ -184,6 +184,21 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertEqual(action["name"], "shell_command")
         self.assertEqual(json.loads(action["input"]), {"command": "Get-Content README.md -TotalCount 20"})
 
+    def test_custom_exec_rejects_unescaped_windows_path(self) -> None:
+        body = codex_body({"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]})
+        tools = codex_tool_bridge.response_client_tools(body)
+        malformed_input = 'const r = await tools.shell_command({command: "Get-Content api\\app.py"}); text(r);'
+        valid_input = 'const r = await tools.shell_command({command: "Get-Content api\\\\app.py"}); text(r);'
+
+        self.assertIsNone(codex_tool_bridge.parse_controller_action(
+            json.dumps({"action": "tool", "name": "exec", "input": malformed_input}),
+            tools,
+        ))
+        self.assertIsNotNone(codex_tool_bridge.parse_controller_action(
+            json.dumps({"action": "tool", "name": "exec", "input": valid_input}),
+            tools,
+        ))
+
     def test_repeated_developer_and_environment_messages_are_preserved(self) -> None:
         environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
         body = codex_body(
@@ -833,6 +848,72 @@ class CodexToolBridgeTests(unittest.TestCase):
         final_output = second_events[-1]["response"]["output"][0]
         self.assertEqual(final_output["content"][0]["text"], "README.md is present")
 
+    def test_delta_input_with_previous_response_keeps_task_context(self) -> None:
+        first = codex_body(
+            {"type": "message", "role": "user", "content": "inspect the current project"},
+        )
+        first.update({
+            "_request_identity_key_id": "admin",
+            "client_metadata": {"session_id": "session-delta", "thread_id": "thread-delta", "turn_id": "turn-1"},
+        })
+        tool_call = {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call-delta",
+            "input": "const r = await tools.shell_command({command: 'Get-ChildItem'}); text(r);",
+        }
+        tool_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-delta",
+            "output": "README.md",
+        }
+        tools = codex_tool_bridge.response_client_tools({**first, "tools": [EXEC_TOOL]})
+        store = codex_conversation_session._SessionStore()
+        with (
+            mock.patch.object(
+                codex_conversation_session.account_service,
+                "resolve_access_token",
+                side_effect=lambda token: token,
+            ),
+            mock.patch.object(
+                codex_conversation_session.account_service,
+                "get_account",
+                return_value={"status": "normal"},
+            ),
+        ):
+            initial_plan = store.prepare(first, tools, [{"role": "system", "content": "full"}], force_tool=False)
+            self.assertTrue(store.commit(
+                initial_plan,
+                first,
+                tools,
+                [tool_call],
+                conversation_id="conv-delta",
+                parent_message_id="node-delta",
+                access_token="token-delta",
+                response_id="resp-delta",
+                usage={},
+            ))
+            continuation = {
+                **first,
+                "previous_response_id": "resp-delta",
+                "client_metadata": {**first["client_metadata"], "turn_id": "turn-2"},
+                "input": [tool_call, tool_output],
+            }
+            plan = store.prepare(
+                continuation,
+                tools,
+                [{"role": "system", "content": "full"}],
+                force_tool=False,
+            )
+
+        self.assertTrue(plan.continued)
+        self.assertEqual(plan.conversation_id, "conv-delta")
+        self.assertEqual(plan.parent_message_id, "node-delta")
+        self.assertEqual(plan.delta_input_items, 1)
+        continuation_text = "\n".join(str(message["content"]) for message in plan.messages)
+        self.assertIn("inspect the current project", continuation_text)
+        self.assertIn("custom_tool_call_output", continuation_text)
+
     def test_task_contract_keeps_analysis_request_valid_without_code_change(self) -> None:
         body = codex_body(
             {"type": "message", "role": "user", "content": "详细了解当前项目，给出优化方案"},
@@ -956,6 +1037,10 @@ class CodexToolBridgeTests(unittest.TestCase):
             events = list(openai_v1_response.handle(continuation))
 
         self.assertEqual(len(captured), 3)
+        repair_text = "\n".join(str(message["content"]) for message in captured[2].messages)
+        self.assertIn("TOOL_DEFINITION_RECORD", repair_text)
+        self.assertIn("CONTROLLER_TASK_CONTRACT", repair_text)
+        self.assertIn("CONTROLLER_REPAIR_RECORD", repair_text)
         item = next(event["item"] for event in events if event["type"] == "response.output_item.done")
         self.assertEqual(item["type"], "custom_tool_call")
         self.assertIn("Get-Content README.md", item["input"])

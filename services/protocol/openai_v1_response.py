@@ -571,6 +571,14 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                 full_controller_messages,
                 force_tool=force_tool,
             )
+            logger.debug({
+                "event": "codex_controller_session_plan",
+                "continued": plan.continued,
+                "replayed": plan.replayed,
+                "delta_input_items": plan.delta_input_items,
+                "conversation_reused": bool(plan.conversation_id),
+                "canonical_input_items": len(plan.canonical_input_items),
+            })
             if plan.replayed:
                 pending_events.extend(_replay_controller_output(plan.output_items))
                 output = plan.output_items
@@ -662,14 +670,51 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                 if rejected_action or invalid_output:
                     repaired_text = ""
                     repair_context = full_text
-                    if duplicate_action:
+                    if action is None and codex_tool_bridge.has_unescaped_windows_exec_input(full_text):
+                        repair_context = (
+                            "INVALID_WINDOWS_PATH_ESCAPE\n"
+                            "The exec JavaScript contained a single backslash in a Windows path. "
+                            "Use forward slashes or escape each backslash as \\\\ before calling the tool.\n"
+                            + full_text
+                        )
+                    elif duplicate_action:
                         repair_context = (
                             "DUPLICATE_COMPLETED_TOOL_ACTION\n"
                             "The proposed action already has a tool result in the current task. "
                             "Choose a different next action or return complete:true only if the task is actually finished.\n"
                             + full_text
                         )
-                    if request.conversation_id and request.parent_message_id:
+                    if request.conversation_id and request.parent_message_id and plan.continued:
+                        # Do not append a repair to the poisoned Web conversation. The
+                        # invalid assistant answer is already part of that cursor and
+                        # can make the model repeat the same answer. Rebuild a small,
+                        # self-contained controller request from the continuation plan;
+                        # it retains the task/result delta without replaying the 100K
+                        # Codex history or the invalid upstream node.
+                        repair_messages = [{
+                            "role": "system",
+                            "content": codex_tool_bridge.controller_prompt(client_tools),
+                        }]
+                        repair_messages.extend(codex_tool_bridge.controller_tool_messages(client_tools))
+                        repair_messages.extend(plan.messages)
+                        repair_messages.extend(
+                            codex_tool_bridge.controller_task_contract_messages(
+                                getattr(plan, "canonical_input_items", None) or body.get("input")
+                            )
+                        )
+                        repair_messages.extend(
+                            codex_tool_bridge.controller_task_anchor_messages(
+                                getattr(plan, "canonical_input_items", None) or body.get("input")
+                            )
+                        )
+                        repair_messages.extend(codex_tool_bridge.controller_turn_state_messages(force_tool))
+                        repair_messages.extend(codex_tool_bridge.controller_repair_messages(repair_context))
+                        repair_conversation_id = ""
+                        repair_parent_message_id = ""
+                    elif request.conversation_id and request.parent_message_id:
+                        # The initial request already contains the complete Codex
+                        # transcript. Keep its Web cursor for a format/path repair so
+                        # we do not duplicate a potentially large first payload.
                         repair_messages = codex_tool_bridge.controller_repair_messages(repair_context)
                         repair_messages.extend(
                             codex_tool_bridge.controller_task_contract_messages(

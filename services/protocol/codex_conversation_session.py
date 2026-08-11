@@ -256,13 +256,12 @@ class _SessionStore:
             metadata = _client_metadata(body)
             session_id = str(metadata.get("session_id") or "").strip()
             turn_id = str(metadata.get("turn_id") or "").strip()
-            if (
+            identity_mismatch = (
                 session.model != _model_signature(body.get("model"))
                 or session.instructions_signature != _json_signature(body.get("instructions"))
                 or (session.session_id and session_id and session.session_id != session_id)
-                or len(input_value) < len(session.input_items)
-                or input_value[:len(session.input_items)] != session.input_items
-            ):
+            )
+            if identity_mismatch:
                 self._sessions.pop(key, None)
                 return ContinuationPlan(
                     key=key,
@@ -284,8 +283,19 @@ class _SessionStore:
                     prior_output_items=copy.deepcopy(session.output_items),
                 )
 
-            prefix_length = _prefix_length(input_value, session.input_items)
             previous_response_id = _previous_response_id(body)
+            prefix_length = _prefix_length(input_value, session.input_items)
+            delta_allowed = (
+                bool(previous_response_id and previous_response_id == session.response_id)
+                or bool(session.session_id and session_id and session.session_id == session_id)
+            )
+            if prefix_length is None and not delta_allowed:
+                self._sessions.pop(key, None)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
             if prefix_length is not None:
                 suffix = copy.deepcopy(input_value[prefix_length:])
                 canonical_input_items = copy.deepcopy(input_value)

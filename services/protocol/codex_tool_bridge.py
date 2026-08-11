@@ -56,6 +56,10 @@ ANALYSIS_TASK_RE = re.compile(
     r"\u4e86\u89e3|\u5206\u6790|\u8bc4\u5ba1|\u5ba1\u67e5|\u4f18\u5316|\u65b9\u6848|\u89e3\u91ca"
     r")"
 )
+UNESCAPED_WINDOWS_PATH_RE = re.compile(
+    r"(?<!\\)(?:(?:[A-Za-z]:)|(?:[A-Za-z0-9_.-]+))\\"
+    r"(?=[A-Za-z0-9_.-]+(?:\\|/|\.|\s|['\"`)}`]|$))"
+)
 
 
 def normalize_namespace(value: object) -> str | None:
@@ -255,6 +259,7 @@ def controller_prompt(tools: list[dict[str, Any]], force_tool: bool = False) -> 
         'Final response: {"action":"final","text":"answer to the user","complete":true}',
         "Function arguments must be a JSON object matching parameters. Custom input must be the raw string accepted by that tool.",
         "The exec custom-tool input is raw JavaScript for its V8 controller, never a bare shell or PowerShell command.",
+        "When a JavaScript string contains a Windows path, escape every backslash as \\\\ or use forward slashes (for example api\\\\app.py or api/app.py). A single api\\app.py is invalid because JavaScript removes that slash before PowerShell runs.",
         "Choose at most one tool. Wait for its result before choosing another tool or giving a final response.",
         "After a tool result, choose another tool whenever that result is not sufficient to complete the original request.",
         "Never repeat an already completed tool action unless the user explicitly asks you to retry it.",
@@ -902,6 +907,8 @@ def parse_controller_action(text: str, tools: list[dict[str, Any]]) -> dict[str,
                 raw_input,
             ):
                 return None
+            if tool["name"] == "exec" and has_unescaped_windows_path(raw_input):
+                return None
             input_value = raw_input
         else:
             arguments = _arguments_object(payload.get("arguments", nested.get("arguments", payload.get("input"))))
@@ -918,6 +925,18 @@ def parse_controller_action(text: str, tools: list[dict[str, Any]]) -> dict[str,
             "input": input_value,
         }
     return None
+
+
+def has_unescaped_windows_exec_input(text: str) -> bool:
+    payload = _json_object(text)
+    if not isinstance(payload, dict):
+        return False
+    nested = payload.get("tool") if isinstance(payload.get("tool"), dict) else {}
+    name = payload.get("name") or payload.get("tool_name") or nested.get("name")
+    if str(name or "").strip().lower() != "exec":
+        return False
+    raw_input = payload.get("input", nested.get("input"))
+    return isinstance(raw_input, str) and has_unescaped_windows_path(raw_input)
 
 
 def final_action_is_complete(action: dict[str, Any] | None) -> bool:
@@ -1085,6 +1104,10 @@ def is_access_refusal(text: str) -> bool:
 
 def is_task_evasion(text: str) -> bool:
     return bool(TASK_EVASION_RE.search(str(text or "")))
+
+
+def has_unescaped_windows_path(text: str) -> bool:
+    return bool(UNESCAPED_WINDOWS_PATH_RE.search(str(text or "")))
 
 
 def is_local_executor_action(action: dict[str, Any] | None) -> bool:
