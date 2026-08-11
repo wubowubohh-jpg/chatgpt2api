@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
@@ -9,7 +10,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
-from services.protocol import codex_tool_bridge
+from services.protocol import codex_conversation_session, codex_tool_bridge
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -450,6 +451,95 @@ def _log_controller_request_shape(
     })
 
 
+def _log_controller_output_shape(text: str, *, attempt: str) -> None:
+    """Expose a bounded controller preview only when explicitly debugging upstream output."""
+    if os.getenv("CHATGPT2API_DEBUG_CONTROLLER_OUTPUT") != "1":
+        return
+    value = str(text or "")
+    logger.debug({
+        "event": "codex_controller_output_shape",
+        "attempt": attempt,
+        "text_bytes": len(value.encode("utf-8")),
+        "preview": value[:800],
+    })
+
+
+def _log_controller_parse_shape(
+    text: str,
+    action: dict[str, Any] | None,
+    tools: list[dict[str, Any]],
+    *,
+    force_tool: bool,
+    attempt: str,
+) -> None:
+    if os.getenv("CHATGPT2API_DEBUG_CONTROLLER_OUTPUT") != "1":
+        return
+    logger.debug({
+        "event": "codex_controller_parse_shape",
+        "attempt": attempt,
+        "force_tool": force_tool,
+        "parsed": bool(action),
+        "parsed_name": str((action or {}).get("name") or ""),
+        "parsed_kind": str((action or {}).get("kind") or ""),
+        "tool_names": [
+            f"{tool.get('namespace') or ''}.{tool.get('name') or ''}:{tool.get('kind') or ''}"
+            for tool in tools
+        ],
+        "text_bytes": len(str(text or '').encode('utf-8')),
+    })
+
+
+def _plain_controller_final(text: str) -> dict[str, str] | None:
+    source = str(text or "").strip()
+    if (
+        not source
+        or codex_tool_bridge.is_access_refusal(source)
+        or source.startswith(("{", "[", "<codex_tool_call", "<custom_tool_call", "<tool_call"))
+    ):
+        return None
+    return {"action": "final", "text": source}
+
+
+def _is_stale_controller_cursor_error(error: Exception) -> bool:
+    status_code = int(getattr(error, "status_code", 0) or 0)
+    if status_code not in {400, 404, 409, 422}:
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in ("conversation", "parent", "cursor", "not found", "invalid"))
+
+
+def _replay_controller_output(
+    output: list[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    for index, original in enumerate(output):
+        item = dict(original)
+        item["status"] = "in_progress"
+        yield {"type": "response.output_item.added", "output_index": index, "item": item}
+        if item.get("type") == "message":
+            text = "".join(
+                str(part.get("text") or "")
+                for part in item.get("content") or []
+                if isinstance(part, dict) and part.get("type") in {"output_text", "text"}
+            )
+            if text:
+                yield {
+                    "type": "response.output_text.delta",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "delta": text,
+                }
+                yield {
+                    "type": "response.output_text.done",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "text": text,
+                }
+        item["status"] = "completed"
+        yield {"type": "response.output_item.done", "output_index": index, "item": item}
+
+
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
@@ -465,78 +555,237 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
             codex_tool_bridge.requires_local_tool(body, client_tools)
             and not codex_tool_bridge.current_turn_has_tool_output(body.get("input"))
         )
-        controller_messages = codex_tool_bridge.controller_messages(
-            body,
-            client_tools,
-            force_tool=force_tool,
+        full_controller_messages = codex_tool_bridge.controller_messages(
+            body, client_tools, force_tool=force_tool,
         )
-        _log_controller_request_shape(controller_messages, tool_count=len(client_tools), attempt="initial")
-        request = ConversationRequest(model=model, messages=controller_messages, thinking_effort=thinking_effort)
-        for delta in stream_text_deltas(backend, request):
-            full_text += delta
-        action = codex_tool_bridge.parse_controller_action(full_text, client_tools)
-        legacy_calls, _legacy_visible_text = parse_client_tool_calls(full_text, client_tools)
-        if action is None and legacy_calls:
-            action = {"action": "tool", **legacy_calls[0]}
-        rejected_action = (
-            action is not None
-            and (
-                (action.get("action") == "final" and codex_tool_bridge.is_access_refusal(str(action.get("text") or "")))
-                or (force_tool and not codex_tool_bridge.is_local_executor_action(action))
-            )
-        )
-        invalid_output = action is None
-        if rejected_action or invalid_output:
-            repaired_text = ""
-            repair_messages = codex_tool_bridge.controller_messages(
+        pending_events: list[dict[str, Any]] = []
+        output: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        with codex_conversation_session.controller_session_lock(body):
+            plan = codex_conversation_session.prepare_controller_request(
                 body,
                 client_tools,
+                full_controller_messages,
                 force_tool=force_tool,
-                invalid_output=full_text,
             )
-            _log_controller_request_shape(repair_messages, tool_count=len(client_tools), attempt="repair")
-            repair_request = ConversationRequest(model=model, messages=repair_messages, thinking_effort=thinking_effort)
-            for delta in stream_text_deltas(backend, repair_request):
-                repaired_text += delta
-            repaired_action = codex_tool_bridge.parse_controller_action(repaired_text, client_tools)
-            repaired_legacy_calls, _repaired_visible_text = parse_client_tool_calls(repaired_text, client_tools)
-            if repaired_action is None and repaired_legacy_calls:
-                repaired_action = {"action": "tool", **repaired_legacy_calls[0]}
-            repaired_refusal = (
-                repaired_action is not None
-                and repaired_action.get("action") == "final"
-                and codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
-            )
-            if repaired_action is not None and not repaired_refusal:
-                action = repaired_action
-                full_text = repaired_text
-            elif force_tool:
-                action = codex_tool_bridge.bootstrap_local_action(client_tools)
+            if plan.replayed:
+                pending_events.extend(_replay_controller_output(plan.output_items))
+                output = plan.output_items
+                usage = plan.usage
             else:
-                raise RuntimeError("Codex tool controller could not produce a valid action")
-        if action is None:
-            raise RuntimeError("Codex tool controller returned no action")
-        if force_tool and not codex_tool_bridge.is_local_executor_action(action):
-            action = codex_tool_bridge.bootstrap_local_action(client_tools)
-            if action is None:
-                raise RuntimeError("Codex request requires a local tool, but no local executor is available")
-        output: list[dict[str, Any]] = []
-        visible_text = ""
-        if action.get("action") == "final":
-            visible_text = str(action.get("text") or "")
-        if visible_text or action.get("action") == "final":
-            text_events, text_item = _text_output_events(visible_text, 0)
-            yield from text_events
-            output.append(text_item)
-        if action.get("action") == "tool":
-            tool_events, tool_items = _client_tool_events([action], len(output))
-            yield from tool_events
-            output.extend(tool_items)
-        usage = token_usage(
-            input_text_tokens=count_message_text_tokens(controller_messages, model),
-            input_image_tokens=count_message_image_tokens(controller_messages, model),
-            output_text_tokens=count_text_tokens(full_text, model),
-        )
+                controller_messages = plan.messages
+                _log_controller_request_shape(
+                    controller_messages,
+                    tool_count=len(client_tools),
+                    attempt="continuation" if plan.continued else "initial",
+                )
+                request = ConversationRequest(
+                    model=model,
+                    messages=controller_messages,
+                    thinking_effort=thinking_effort,
+                    conversation_id=plan.conversation_id,
+                    parent_message_id=plan.parent_message_id,
+                    access_token=plan.access_token,
+                )
+                request_parent_before = request.parent_message_id
+                try:
+                    for delta in stream_text_deltas(backend, request):
+                        full_text += delta
+                    _log_controller_output_shape(full_text, attempt="initial" if not plan.continued else "continuation")
+                except Exception as exc:
+                    if not plan.continued or not _is_stale_controller_cursor_error(exc):
+                        raise
+                    codex_conversation_session.invalidate_controller_session(plan)
+                    plan = codex_conversation_session.ContinuationPlan(
+                        key=plan.key,
+                        messages=full_controller_messages,
+                        access_token=plan.access_token,
+                    )
+                    controller_messages = plan.messages
+                    _log_controller_request_shape(
+                        controller_messages,
+                        tool_count=len(client_tools),
+                        attempt="continuation_reset",
+                    )
+                    request = ConversationRequest(
+                        model=model,
+                        messages=controller_messages,
+                        thinking_effort=thinking_effort,
+                        access_token=plan.access_token,
+                    )
+                    request_parent_before = ""
+                    full_text = ""
+                    for delta in stream_text_deltas(backend, request):
+                        full_text += delta
+                    _log_controller_output_shape(full_text, attempt="continuation_reset")
+                action = codex_tool_bridge.parse_controller_action(full_text, client_tools)
+                _log_controller_parse_shape(
+                    full_text,
+                    action,
+                    client_tools,
+                    force_tool=force_tool,
+                    attempt="continuation" if plan.continued else "initial",
+                )
+                legacy_calls, _legacy_visible_text = parse_client_tool_calls(full_text, client_tools)
+                if action is None and legacy_calls:
+                    action = {"action": "tool", **legacy_calls[0]}
+                if action is None and codex_tool_bridge.current_turn_has_tool_output(body.get("input")):
+                    action = _plain_controller_final(full_text)
+                rejected_action = (
+                    action is not None
+                    and (
+                        (action.get("action") == "final" and codex_tool_bridge.is_access_refusal(str(action.get("text") or "")))
+                        or (force_tool and not codex_tool_bridge.is_local_executor_action(action))
+                    )
+                )
+                invalid_output = action is None
+                if rejected_action or invalid_output:
+                    repaired_text = ""
+                    if request.conversation_id and request.parent_message_id:
+                        repair_messages = codex_tool_bridge.controller_repair_messages(full_text)
+                        repair_conversation_id = request.conversation_id
+                        repair_parent_message_id = request.parent_message_id
+                    else:
+                        repair_messages = codex_tool_bridge.controller_messages(
+                            body,
+                            client_tools,
+                            force_tool=force_tool,
+                            invalid_output=full_text,
+                        )
+                        repair_conversation_id = ""
+                        repair_parent_message_id = ""
+                    _log_controller_request_shape(
+                        repair_messages,
+                        tool_count=len(client_tools),
+                        attempt="repair_continuation" if repair_conversation_id else "repair",
+                    )
+                    repair_request = ConversationRequest(
+                        model=model,
+                        messages=repair_messages,
+                        thinking_effort=thinking_effort,
+                        conversation_id=repair_conversation_id,
+                        parent_message_id=repair_parent_message_id,
+                        access_token=request.access_token,
+                    )
+                    repair_parent_before = repair_request.parent_message_id
+                    try:
+                        for delta in stream_text_deltas(backend, repair_request):
+                            repaired_text += delta
+                    except Exception as exc:
+                        if not repair_conversation_id or not _is_stale_controller_cursor_error(exc):
+                            raise
+                        # The first Web conversation may have expired between the
+                        # controller response and its repair. Rebuild the repair
+                        # request without carrying a stale cursor.
+                        codex_conversation_session.invalidate_controller_session(plan)
+                        repair_messages = codex_tool_bridge.controller_messages(
+                            body,
+                            client_tools,
+                            force_tool=force_tool,
+                            invalid_output=full_text,
+                        )
+                        repair_conversation_id = ""
+                        repair_parent_message_id = ""
+                        repaired_text = ""
+                        plan = codex_conversation_session.ContinuationPlan(
+                            key=plan.key,
+                            messages=repair_messages,
+                            access_token=request.access_token or plan.access_token,
+                        )
+                        repair_request = ConversationRequest(
+                            model=model,
+                            messages=repair_messages,
+                            thinking_effort=thinking_effort,
+                            access_token=request.access_token or plan.access_token,
+                        )
+                        repair_parent_before = ""
+                        _log_controller_request_shape(
+                            repair_messages,
+                            tool_count=len(client_tools),
+                            attempt="repair_reset",
+                        )
+                        for delta in stream_text_deltas(backend, repair_request):
+                            repaired_text += delta
+                    _log_controller_output_shape(
+                        repaired_text,
+                        attempt="repair_continuation" if repair_conversation_id else "repair",
+                    )
+                    repaired_action = codex_tool_bridge.parse_controller_action(repaired_text, client_tools)
+                    _log_controller_parse_shape(
+                        repaired_text,
+                        repaired_action,
+                        client_tools,
+                        force_tool=force_tool,
+                        attempt="repair_continuation" if repair_conversation_id else "repair",
+                    )
+                    repaired_legacy_calls, _repaired_visible_text = parse_client_tool_calls(repaired_text, client_tools)
+                    if repaired_action is None and repaired_legacy_calls:
+                        repaired_action = {"action": "tool", **repaired_legacy_calls[0]}
+                    if repaired_action is None and codex_tool_bridge.current_turn_has_tool_output(body.get("input")):
+                        repaired_action = _plain_controller_final(repaired_text)
+                    repaired_refusal = (
+                        repaired_action is not None
+                        and repaired_action.get("action") == "final"
+                        and codex_tool_bridge.is_access_refusal(str(repaired_action.get("text") or ""))
+                    )
+                    if repaired_action is not None and not repaired_refusal:
+                        action = repaired_action
+                        full_text = repaired_text
+                        request = repair_request
+                        request_parent_before = repair_parent_before
+                    elif force_tool:
+                        action = codex_tool_bridge.bootstrap_local_action(client_tools)
+                        request = repair_request
+                        request_parent_before = repair_parent_before
+                    else:
+                        raise RuntimeError("Codex tool controller could not produce a valid action")
+                if action is None:
+                    raise RuntimeError("Codex tool controller returned no action")
+                if force_tool and not codex_tool_bridge.is_local_executor_action(action):
+                    action = codex_tool_bridge.bootstrap_local_action(client_tools)
+                    if action is None:
+                        raise RuntimeError("Codex request requires a local tool, but no local executor is available")
+                visible_text = str(action.get("text") or "") if action.get("action") == "final" else ""
+                if visible_text or action.get("action") == "final":
+                    text_events, text_item = _text_output_events(visible_text, 0)
+                    pending_events.extend(text_events)
+                    output.append(text_item)
+                if action.get("action") == "tool":
+                    tool_events, tool_items = _client_tool_events([action], len(output))
+                    pending_events.extend(tool_events)
+                    output.extend(tool_items)
+                usage = token_usage(
+                    input_text_tokens=count_message_text_tokens(full_controller_messages, model),
+                    input_image_tokens=count_message_image_tokens(full_controller_messages, model),
+                    output_text_tokens=count_text_tokens(full_text, model),
+                )
+                committed = codex_conversation_session.commit_controller_response(
+                    plan,
+                    body,
+                    client_tools,
+                    output,
+                    conversation_id=request.conversation_id,
+                    parent_message_id=(
+                        request.parent_message_id
+                        if request.parent_message_id != request_parent_before
+                        else ""
+                    ),
+                    access_token=request.access_token,
+                    response_id=response_id,
+                    usage=usage,
+                )
+                if not committed:
+                    # Do not leave a stale parent cursor after an incomplete SSE
+                    # stream. The next request will deliberately rebuild the Web
+                    # conversation instead of branching from an unknown node.
+                    codex_conversation_session.invalidate_controller_session(plan)
+                    logger.warning({
+                        "event": "codex_controller_session_not_committed",
+                        "continued": plan.continued,
+                        "has_conversation_id": bool(request.conversation_id),
+                        "has_parent_message_id": bool(request.parent_message_id),
+                    })
+        yield from pending_events
         yield response_completed(response_id, model, created, output, usage)
         return
     request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)

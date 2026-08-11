@@ -151,6 +151,8 @@ def create_router() -> APIRouter:
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        # Keep controller-session state isolated when clients reuse a prompt cache key.
+        payload["_request_identity_key_id"] = str(identity.get("id") or "anonymous")
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(

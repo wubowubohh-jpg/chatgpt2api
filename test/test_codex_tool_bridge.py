@@ -6,7 +6,8 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol import codex_tool_bridge, openai_v1_response
+from services.protocol import codex_conversation_session, codex_tool_bridge, openai_v1_response
+from services.protocol.conversation import iter_conversation_payloads
 from utils.helper import UpstreamHTTPError, responses_sse_stream
 
 
@@ -33,6 +34,7 @@ def codex_body(*items, tools=None):
 
 class CodexToolBridgeTests(unittest.TestCase):
     def setUp(self) -> None:
+        codex_conversation_session.clear_controller_sessions()
         self.old_cache_settings = config.data.get("chat_completion_cache")
         config.data["chat_completion_cache"] = {
             "enabled": True,
@@ -46,6 +48,7 @@ class CodexToolBridgeTests(unittest.TestCase):
         }
 
     def tearDown(self) -> None:
+        codex_conversation_session.clear_controller_sessions()
         if self.old_cache_settings is None:
             config.data.pop("chat_completion_cache", None)
         else:
@@ -90,6 +93,51 @@ class CodexToolBridgeTests(unittest.TestCase):
 
         self.assertEqual([(tool["kind"], tool["name"]) for tool in tools], [("custom", "exec"), ("function", "wait")])
 
+    def test_controller_prompt_only_examples_available_tools(self) -> None:
+        body = codex_body({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }],
+        })
+        tools = codex_tool_bridge.response_client_tools(body)
+        prompt = codex_tool_bridge.controller_prompt(tools)
+
+        self.assertIn('"name":"shell_command"', prompt)
+        self.assertNotIn("Custom exec tool:", prompt)
+
+    def test_custom_exec_alias_is_coerced_to_shell_command(self) -> None:
+        body = codex_body({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }],
+        })
+        tools = codex_tool_bridge.response_client_tools(body)
+        action = codex_tool_bridge.parse_controller_action(
+            '{"action":"tool","name":"exec","input":"const r = await tools.shell_command({command: \\"Get-Content README.md -TotalCount 20\\"}); text(r);"}',
+            tools,
+        )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["kind"], "function")
+        self.assertEqual(action["name"], "shell_command")
+        self.assertEqual(json.loads(action["input"]), {"command": "Get-Content README.md -TotalCount 20"})
+
     def test_repeated_developer_and_environment_messages_are_preserved(self) -> None:
         environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
         body = codex_body(
@@ -105,7 +153,10 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertEqual(transcript.count("<environment_context>"), 2)
         self.assertEqual(sum(message["content"].endswith(environment) for message in messages), 2)
-        self.assertIn("MUST select a local inspection executor action", messages[0]["content"])
+        self.assertIn(
+            "MUST select a local inspection executor action",
+            "\n".join(message["content"] for message in messages),
+        )
 
         backend = OpenAIBackendAPI()
         try:
@@ -587,6 +638,131 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertIn('"type": "custom_tool_call_output"', request_text)
         self.assertIn("call_1", request_text)
         self.assertIn("README.md", request_text)
+
+    def test_codex_thread_continuation_sends_only_new_tool_result(self) -> None:
+        environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
+        first = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": environment}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read the current project"}]},
+        )
+        first.update({
+            "prompt_cache_key": "shared-session",
+            "_request_identity_key_id": "admin",
+            "client_metadata": {"session_id": "session-1", "thread_id": "thread-1", "turn_id": "turn-1"},
+        })
+        captured = []
+        cursors_before_stream = []
+
+        def fake_stream(_backend, request):
+            captured.append(request)
+            cursors_before_stream.append((request.conversation_id, request.parent_message_id, request.access_token))
+            request.conversation_id = "conv-1"
+            request.parent_message_id = f"node-{len(captured)}"
+            request.access_token = "token-1"
+            if len(captured) == 1:
+                yield json.dumps({
+                    "action": "tool",
+                    "name": "exec",
+                    "input": "const r = await tools.shell_command({command: 'Get-ChildItem'}); text(r);",
+                })
+            else:
+                yield '{"action":"final","text":"README.md is present"}'
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.resolve_access_token",
+                side_effect=lambda token: token,
+            ),
+            mock.patch(
+                "services.protocol.codex_conversation_session.account_service.get_account",
+                return_value={"status": "normal"},
+            ),
+        ):
+            first_events = list(openai_v1_response.handle(first))
+            call_item = next(
+                event["item"]
+                for event in first_events
+                if event["type"] == "response.output_item.done" and event["item"]["type"] == "custom_tool_call"
+            )
+            second = {
+                **first,
+                "model": "gpt-5-6-luna",
+                "input": [
+                    *first["input"],
+                    call_item,
+                    {"type": "custom_tool_call_output", "call_id": call_item["call_id"], "output": "README.md"},
+                ],
+            }
+            second["client_metadata"] = {**first["client_metadata"], "turn_id": "turn-1"}
+            second_events = list(openai_v1_response.handle(second))
+
+        self.assertEqual(len(captured), 2)
+        continuation = captured[1]
+        self.assertEqual(cursors_before_stream[1], ("conv-1", "node-1", "token-1"))
+        continuation_text = "\n".join(message["content"] for message in continuation.messages)
+        self.assertIn("custom_tool_call_output", continuation_text)
+        self.assertIn("README.md", continuation_text)
+        self.assertNotIn(environment, continuation_text)
+        self.assertNotIn("read the current project", continuation_text)
+        self.assertIn("force_local_tool=false", continuation_text)
+        final_output = second_events[-1]["response"]["output"][0]
+        self.assertEqual(final_output["content"][0]["text"], "README.md is present")
+
+    def test_plain_text_after_tool_result_is_accepted_as_final(self) -> None:
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "user", "content": "inspect the project"},
+            {"type": "custom_tool_call", "name": "exec", "call_id": "call-1", "input": "text('ok')"},
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "README.md"},
+        )
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch(
+                "services.protocol.openai_v1_response.stream_text_deltas",
+                return_value=iter(["README.md is present"]),
+            ) as stream,
+        ):
+            events = list(openai_v1_response.handle(body))
+
+        self.assertEqual(stream.call_count, 1)
+        self.assertEqual(events[-1]["response"]["output"][0]["content"][0]["text"], "README.md is present")
+
+    def test_conversation_cursor_is_captured_and_reused_in_payload(self) -> None:
+        payloads = [
+            json.dumps({
+                "conversation_id": "conv-1",
+                "message": {
+                    "id": "assistant-node-1",
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["done"]},
+                },
+            }),
+            "[DONE]",
+        ]
+
+        events = list(iter_conversation_payloads(iter(payloads)))
+        self.assertEqual(events[-1]["conversation_id"], "conv-1")
+        self.assertEqual(events[-1]["parent_message_id"], "assistant-node-1")
+
+        backend = OpenAIBackendAPI()
+        try:
+            payload = backend._conversation_payload(
+                [{"role": "user", "content": "next"}],
+                "gpt-5.6-luna",
+                "Asia/Shanghai",
+                conversation_id="conv-1",
+                parent_message_id="assistant-node-1",
+            )
+        finally:
+            backend.close()
+        self.assertEqual(payload["conversation_id"], "conv-1")
+        self.assertEqual(payload["parent_message_id"], "assistant-node-1")
 
     def test_tool_search_action_emits_client_search_item(self) -> None:
         body = codex_body(

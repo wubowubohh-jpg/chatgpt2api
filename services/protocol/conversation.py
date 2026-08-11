@@ -309,6 +309,9 @@ class ConversationRequest:
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
     thinking_effort: str = ""
+    conversation_id: str = ""
+    parent_message_id: str = ""
+    access_token: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -324,6 +327,7 @@ class ConversationState:
     text: str = ""
     raw_text: str = ""
     conversation_id: str = ""
+    assistant_message_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
@@ -626,6 +630,15 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
     value = event.get("v")
     if isinstance(value, dict):
         state.conversation_id = str(value.get("conversation_id") or state.conversation_id)
+    for candidate in (event, value):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict) or not is_visible_assistant_message(message):
+            continue
+        message_id = str(message.get("id") or "").strip()
+        if message_id:
+            state.assistant_message_id = message_id
     if event.get("type") == "moderation":
         moderation = event.get("moderation_response")
         if isinstance(moderation, dict) and moderation.get("blocked") is True:
@@ -643,6 +656,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "type": event_type,
         "text": state.text,
         "conversation_id": state.conversation_id,
+        "parent_message_id": state.assistant_message_id,
         "file_ids": list(state.file_ids),
         "sediment_ids": list(state.sediment_ids),
         "blocked": state.blocked,
@@ -711,6 +725,8 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    conversation_id: str = "",
+    parent_message_id: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -725,6 +741,8 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        conversation_id=conversation_id if not image_model else "",
+        parent_message_id=parent_message_id if not image_model else "",
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -735,7 +753,7 @@ def text_backend(model: str = "auto") -> OpenAIBackendAPI:
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
-    token = getattr(backend, "access_token", "")
+    token = request.access_token or getattr(backend, "access_token", "")
     emitted = False
     while True:
         if token and token in attempted_tokens:
@@ -751,14 +769,28 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 model=request.model,
                 prompt=request.prompt,
                 thinking_effort=request.thinking_effort,
+                conversation_id=request.conversation_id,
+                parent_message_id=request.parent_message_id,
             ):
+                request.conversation_id = str(event.get("conversation_id") or request.conversation_id)
+                request.parent_message_id = str(event.get("parent_message_id") or request.parent_message_id)
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
                     yield delta
+            if request.conversation_id and not request.parent_message_id:
+                try:
+                    conversation = active_backend._get_conversation(request.conversation_id)
+                    request.parent_message_id = str(conversation.get("current_node") or "").strip()
+                except Exception as exc:
+                    logger.warning({
+                        "event": "text_conversation_cursor_recovery_failed",
+                        "error_type": type(exc).__name__,
+                    })
             account_service.mark_text_used(token)
+            request.access_token = token
             return
         except Exception as exc:
             error_message = str(exc)
@@ -766,13 +798,22 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
+                    request.access_token = token
                 else:
+                    # A Web conversation is owned by the account that created it.
+                    # Never continue an existing cursor with another pooled account;
+                    # the caller must discard the cursor and start a fresh request.
+                    if request.conversation_id or request.parent_message_id:
+                        raise RuntimeError(
+                            "text conversation account token became invalid; continuation discarded"
+                        ) from exc
                     account_service.remove_invalid_token(token, "text_stream")
                     token = account_service.get_text_access_token(
                         excluded_tokens=set(attempted_tokens),
                         model=request.model,
                     )
                 if token:
+                    request.access_token = token
                     continue
             raise
         finally:
