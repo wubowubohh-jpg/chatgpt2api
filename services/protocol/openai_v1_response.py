@@ -481,6 +481,7 @@ def _log_controller_parse_shape(
         "parsed": bool(action),
         "parsed_name": str((action or {}).get("name") or ""),
         "parsed_kind": str((action or {}).get("kind") or ""),
+        "parsed_complete": bool((action or {}).get("complete")) if (action or {}).get("action") == "final" else None,
         "tool_names": [
             f"{tool.get('namespace') or ''}.{tool.get('name') or ''}:{tool.get('kind') or ''}"
             for tool in tools
@@ -489,7 +490,7 @@ def _log_controller_parse_shape(
     })
 
 
-def _plain_controller_final(text: str) -> dict[str, str] | None:
+def _plain_controller_final(text: str) -> dict[str, Any] | None:
     source = str(text or "").strip()
     if (
         not source
@@ -497,7 +498,7 @@ def _plain_controller_final(text: str) -> dict[str, str] | None:
         or source.startswith(("{", "[", "<codex_tool_call", "<custom_tool_call", "<tool_call"))
     ):
         return None
-    return {"action": "final", "text": source}
+    return {"action": "final", "text": source, "complete": False}
 
 
 def _is_stale_controller_cursor_error(error: Exception) -> bool:
@@ -551,9 +552,11 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     yield response_created(response_id, model, created)
     client_tools = response_client_tools(body)
     if client_tools:
+        turn_has_tool_output = codex_tool_bridge.current_turn_has_tool_output(body.get("input"))
+        completion_required = turn_has_tool_output
         force_tool = (
             codex_tool_bridge.requires_local_tool(body, client_tools)
-            and not codex_tool_bridge.current_turn_has_tool_output(body.get("input"))
+            and not turn_has_tool_output
         )
         full_controller_messages = codex_tool_bridge.controller_messages(
             body, client_tools, force_tool=force_tool,
@@ -629,12 +632,17 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                 legacy_calls, _legacy_visible_text = parse_client_tool_calls(full_text, client_tools)
                 if action is None and legacy_calls:
                     action = {"action": "tool", **legacy_calls[0]}
-                if action is None and codex_tool_bridge.current_turn_has_tool_output(body.get("input")):
+                if action is None and turn_has_tool_output:
                     action = _plain_controller_final(full_text)
                 rejected_action = (
                     action is not None
                     and (
                         (action.get("action") == "final" and codex_tool_bridge.is_access_refusal(str(action.get("text") or "")))
+                        or (
+                            completion_required
+                            and action.get("action") == "final"
+                            and not codex_tool_bridge.final_action_is_complete(action)
+                        )
                         or (force_tool and not codex_tool_bridge.is_local_executor_action(action))
                     )
                 )
@@ -721,7 +729,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                     repaired_legacy_calls, _repaired_visible_text = parse_client_tool_calls(repaired_text, client_tools)
                     if repaired_action is None and repaired_legacy_calls:
                         repaired_action = {"action": "tool", **repaired_legacy_calls[0]}
-                    if repaired_action is None and codex_tool_bridge.current_turn_has_tool_output(body.get("input")):
+                    if repaired_action is None and turn_has_tool_output:
                         repaired_action = _plain_controller_final(repaired_text)
                     repaired_refusal = (
                         repaired_action is not None
@@ -733,12 +741,23 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
                         and repaired_action is not None
                         and not codex_tool_bridge.is_local_executor_action(repaired_action)
                     )
-                    if repaired_action is not None and not repaired_refusal and not repaired_force_tool_rejection:
+                    repaired_completion_rejection = (
+                        completion_required
+                        and repaired_action is not None
+                        and repaired_action.get("action") == "final"
+                        and not codex_tool_bridge.final_action_is_complete(repaired_action)
+                    )
+                    if (
+                        repaired_action is not None
+                        and not repaired_refusal
+                        and not repaired_force_tool_rejection
+                        and not repaired_completion_rejection
+                    ):
                         action = repaired_action
                         full_text = repaired_text
                         request = repair_request
                         request_parent_before = repair_parent_before
-                    elif force_tool:
+                    elif force_tool or completion_required:
                         action = codex_tool_bridge.bootstrap_local_action(client_tools)
                         request = repair_request
                         request_parent_before = repair_parent_before

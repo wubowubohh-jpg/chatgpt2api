@@ -28,6 +28,10 @@ LOCAL_TASK_RE = re.compile(
     r"项目|源码|代码库|文件|目录|路径|提交"
     r")"
 )
+LOCAL_FOLLOWUP_RE = re.compile(
+    r"(?i)(?:\banaly[sz](?:e|ed|es|ing)?\b|\banalysis\b|\breview\b|\bunderstand\b|"
+    r"\bcontinue\b|\bdeeper\b|\bfurther\b|深入|分析|继续|进一步|详细|了解|理解|研究)"
+)
 REFUSAL_RE = re.compile(
     r"(?i)(?:"
     r"(?:i\s+)?(?:can(?:not|'t)|am unable to)\s+(?:directly\s+)?(?:access|read|inspect|browse|open|run|execute)|"
@@ -231,12 +235,13 @@ def controller_prompt(tools: list[dict[str, Any]], force_tool: bool = False) -> 
         "Obey the latest CONTROLLER_TURN_STATE record. It replaces every earlier turn-state record.",
         "Return exactly one JSON object and no markdown or surrounding prose.",
         *examples,
-        'Final response: {"action":"final","text":"answer to the user"}',
+        'Final response: {"action":"final","text":"answer to the user","complete":true}',
         "Function arguments must be a JSON object matching parameters. Custom input must be the raw string accepted by that tool.",
         "The exec custom-tool input is raw JavaScript for its V8 controller, never a bare shell or PowerShell command.",
         "Choose at most one tool. Wait for its result before choosing another tool or giving a final response.",
         "After a tool result, choose another tool whenever that result is not sufficient to complete the original request.",
-        "Return a final response only when the original request is fully answered and all factual claims are grounded in the conversation or tool results.",
+        "Tools have priority over prose while any requested step remains. Do not describe a plan or say what you will inspect; perform the next step with exactly one available tool.",
+        "A final response is valid only when the original request is fully completed; include complete:true in that final JSON object. Never use complete:true merely because one tool returned a result.",
         "Callable tool index (full definitions follow in separate system records):",
         json.dumps(registry, ensure_ascii=False, indent=2),
     ])
@@ -245,13 +250,13 @@ def controller_prompt(tools: list[dict[str, Any]], force_tool: bool = False) -> 
 def controller_turn_state_messages(force_tool: bool) -> list[dict[str, str]]:
     rule = (
         "force_local_tool=true\n"
-        "The current request requires local workspace state and has no tool result yet. "
-        "You MUST select a local inspection executor action (exec, shell_command, or exec_command); "
+        "The current request requires local workspace state. "
+        "You MUST select the next local inspection executor action (exec, shell_command, or exec_command) now; "
         "a final or unrelated tool action is invalid."
         if force_tool
         else
         "force_local_tool=false\n"
-        "Select a tool when external state is needed. Otherwise return the final answer."
+        "Select the next tool before writing prose whenever any requested step remains. Otherwise return a final action only with complete:true."
     )
     return _bounded_records(
         "CONTROLLER_TURN_STATE latest=true supersedes_all_previous=true",
@@ -516,6 +521,8 @@ def controller_repair_messages(invalid_output: str) -> list[dict[str, str]]:
     instruction = (
         "The previous controller response was invalid. Return exactly one valid JSON action under "
         "the controller protocol already established in this conversation. Do not add prose or a code fence.\n"
+        "If the original request is fully completed, return a final action with complete:true. "
+        "Otherwise select the next available tool now, step by step; do not return a plan, explanation, or final action without complete:true.\n"
         "PREVIOUS_INVALID_CONTROLLER_OUTPUT\n"
         + str(invalid_output or "")
     )
@@ -692,7 +699,10 @@ def parse_controller_action(text: str, tools: list[dict[str, Any]]) -> dict[str,
         if action in {"final", "respond", "answer"}:
             answer = payload.get("text", payload.get("answer", payload.get("response", "")))
             if isinstance(answer, str) and answer.strip():
-                return {"action": "final", "text": answer}
+                complete = payload.get("complete", payload.get("completed", payload.get("done", False)))
+                if isinstance(complete, str):
+                    complete = complete.strip().lower() in {"true", "1", "yes"}
+                return {"action": "final", "text": answer, "complete": complete is True}
             return None
         if action not in {"tool", "call", "tool_call"}:
             return None
@@ -738,6 +748,12 @@ def parse_controller_action(text: str, tools: list[dict[str, Any]]) -> dict[str,
             "input": input_value,
         }
     return None
+
+
+def final_action_is_complete(action: dict[str, Any] | None) -> bool:
+    if not action:
+        return False
+    return action.get("action") != "final" or action.get("complete") is True
 
 
 def tool_history_message(
@@ -821,6 +837,56 @@ def current_turn_has_tool_output(input_value: object) -> bool:
     )
 
 
+def _has_local_tool_history(input_value: object) -> bool:
+    if not isinstance(input_value, list):
+        return False
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type not in {"custom_tool_call", "function_call"}:
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = str(item.get("name") or function.get("name") or "").strip()
+        namespace = normalize_namespace(item.get("namespace"))
+        if namespace is None and name in {"exec", "shell_command", "exec_command"}:
+            return True
+    return False
+
+
+def _has_prior_local_request(input_value: object) -> bool:
+    if not isinstance(input_value, list):
+        return False
+    user_indexes = [
+        index
+        for index, item in enumerate(input_value)
+        if isinstance(item, dict)
+        and str(item.get("role") or "").lower() == "user"
+        and str(item.get("type") or "message").lower() in {"message", ""}
+    ]
+    if not user_indexes:
+        return False
+    latest_user_index = user_indexes[-1]
+    for item in input_value[:latest_user_index]:
+        if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict)
+                and str(part.get("type") or "") in {"text", "input_text", "output_text"}
+            )
+        else:
+            text = ""
+        if LOCAL_TASK_RE.search(text):
+            return True
+    return False
+
+
 def requires_local_tool(body: dict[str, Any], tools: list[dict[str, Any]]) -> bool:
     has_local_executor = any(_is_local_executor_tool(tool) for tool in tools)
     if not has_local_executor:
@@ -833,7 +899,14 @@ def requires_local_tool(body: dict[str, Any], tools: list[dict[str, Any]]) -> bo
     )
     user_text = latest_user_text(input_value)
     explicit_local_request = bool(re.search(r"(?i)(current|local|this)\s+(?:project|workspace|repo|directory|file)|当前项目|当前工作区|本地文件", user_text))
-    return (has_workspace_context or explicit_local_request) and bool(LOCAL_TASK_RE.search(user_text))
+    local_request = bool(LOCAL_TASK_RE.search(user_text))
+    has_local_tool_history = _has_local_tool_history(input_value)
+    has_prior_local_request = _has_prior_local_request(input_value)
+    followup_local_request = (
+        (has_local_tool_history or has_prior_local_request)
+        and bool(LOCAL_FOLLOWUP_RE.search(user_text))
+    )
+    return (has_workspace_context or explicit_local_request or followup_local_request) and (local_request or followup_local_request)
 
 
 def is_access_refusal(text: str) -> bool:

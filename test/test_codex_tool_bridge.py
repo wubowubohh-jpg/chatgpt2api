@@ -113,6 +113,52 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertIn('"name":"shell_command"', prompt)
         self.assertNotIn("Custom exec tool:", prompt)
 
+    def test_controller_messages_include_actual_codex_tool_schemas(self) -> None:
+        body = codex_body(
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "Built-in tools",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "shell_command",
+                                "description": "Run a local command",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                    "required": ["command"],
+                                },
+                            },
+                            {
+                                "type": "function",
+                                "name": "apply_patch",
+                                "description": "Edit a file",
+                                "parameters": {"type": "object"},
+                            },
+                        ],
+                    },
+                ],
+            },
+            {"type": "message", "role": "user", "content": "inspect the project"},
+        )
+        tools = codex_tool_bridge.response_client_tools(body)
+        messages = codex_tool_bridge.controller_messages(body, tools)
+        transcript = "\n".join(str(message["content"]) for message in messages)
+
+        self.assertIn("TOOL_DEFINITION_RECORD", transcript)
+        self.assertIn('name=shell_command', transcript)
+        self.assertIn('name=apply_patch', transcript)
+        self.assertIn('"required":["command"]', transcript)
+        self.assertIn('"name":"shell_command"', transcript)
+        self.assertIn('"complete":true', transcript)
+        self.assertIn("Tools have priority over prose", transcript)
+        self.assertIn("Select the next tool before writing prose", transcript)
+
     def test_custom_exec_alias_is_coerced_to_shell_command(self) -> None:
         body = codex_body({
             "type": "additional_tools",
@@ -154,7 +200,7 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertEqual(transcript.count("<environment_context>"), 2)
         self.assertEqual(sum(message["content"].endswith(environment) for message in messages), 2)
         self.assertIn(
-            "MUST select a local inspection executor action",
+            "MUST select the next local inspection executor action",
             "\n".join(message["content"] for message in messages),
         )
 
@@ -319,6 +365,23 @@ class CodexToolBridgeTests(unittest.TestCase):
             tools,
         ))
 
+    def test_final_completion_marker_is_explicit(self) -> None:
+        tools = codex_tool_bridge.response_client_tools(codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+        ))
+
+        incomplete = codex_tool_bridge.parse_controller_action(
+            '{"action":"final","text":"I inspected one file"}',
+            tools,
+        )
+        complete = codex_tool_bridge.parse_controller_action(
+            '{"action":"final","text":"The task is complete","complete":true}',
+            tools,
+        )
+
+        self.assertFalse(codex_tool_bridge.final_action_is_complete(incomplete))
+        self.assertTrue(codex_tool_bridge.final_action_is_complete(complete))
+
     def test_deferred_tool_cannot_be_called_before_tool_search(self) -> None:
         body = codex_body(
             {"type": "additional_tools", "role": "developer", "tools": [
@@ -411,7 +474,7 @@ class CodexToolBridgeTests(unittest.TestCase):
             mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
             mock.patch(
                 "services.protocol.openai_v1_response.stream_text_deltas",
-                return_value=iter(['{"action":"final","text":"Event created"}']),
+                return_value=iter(['{"action":"final","text":"Event created","complete":true}']),
             ),
         ):
             final_events = list(openai_v1_response.handle(continuation))
@@ -479,6 +542,33 @@ class CodexToolBridgeTests(unittest.TestCase):
         self.assertEqual(item["type"], "custom_tool_call")
         self.assertEqual(item["name"], "exec")
         self.assertIn("Get-ChildItem -Force", item["input"])
+
+    def test_followup_analysis_after_local_tool_call_still_requires_executor(self) -> None:
+        environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": environment}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read the current project"}]},
+            {"type": "custom_tool_call", "name": "exec", "call_id": "call-1", "input": "text('README.md')"},
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "README.md"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "深入分析"}]},
+        )
+        tools = codex_tool_bridge.response_client_tools(body)
+
+        self.assertFalse(codex_tool_bridge.current_turn_has_tool_output(body["input"]))
+        self.assertTrue(codex_tool_bridge.requires_local_tool(body, tools))
+
+    def test_followup_analysis_after_local_prompt_still_requires_executor(self) -> None:
+        environment = "<environment_context><cwd>C:\\project</cwd></environment_context>"
+        body = codex_body(
+            {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": environment}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "了解当前项目"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "深入分析"}]},
+        )
+        tools = codex_tool_bridge.response_client_tools(body)
+
+        self.assertTrue(codex_tool_bridge.requires_local_tool(body, tools))
 
     def test_plain_shell_text_is_rejected_as_exec_javascript(self) -> None:
         tools = codex_tool_bridge.response_client_tools(codex_body(
@@ -654,7 +744,7 @@ class CodexToolBridgeTests(unittest.TestCase):
 
         def fake_stream(_backend, request):
             captured.append(request)
-            yield '{"action":"final","text":"README.md is present"}'
+            yield '{"action":"final","text":"README.md is present","complete":true}'
 
         with (
             mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
@@ -697,7 +787,7 @@ class CodexToolBridgeTests(unittest.TestCase):
                     "input": "const r = await tools.shell_command({command: 'Get-ChildItem'}); text(r);",
                 })
             else:
-                yield '{"action":"final","text":"README.md is present"}'
+                yield '{"action":"final","text":"README.md is present","complete":true}'
 
         with (
             mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
@@ -741,7 +831,7 @@ class CodexToolBridgeTests(unittest.TestCase):
         final_output = second_events[-1]["response"]["output"][0]
         self.assertEqual(final_output["content"][0]["text"], "README.md is present")
 
-    def test_plain_text_after_tool_result_is_accepted_as_final(self) -> None:
+    def test_plain_text_after_tool_result_is_repaired_before_final(self) -> None:
         body = codex_body(
             {"type": "additional_tools", "role": "developer", "tools": [EXEC_TOOL]},
             {"type": "message", "role": "user", "content": "inspect the project"},
@@ -749,16 +839,24 @@ class CodexToolBridgeTests(unittest.TestCase):
             {"type": "custom_tool_call_output", "call_id": "call-1", "output": "README.md"},
         )
 
+        outputs = iter([
+            "README.md is present",
+            '{"action":"final","text":"README.md is present","complete":true}',
+        ])
+
+        def fake_stream(_backend, _request):
+            yield next(outputs)
+
         with (
             mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
             mock.patch(
                 "services.protocol.openai_v1_response.stream_text_deltas",
-                return_value=iter(["README.md is present"]),
+                side_effect=fake_stream,
             ) as stream,
         ):
             events = list(openai_v1_response.handle(body))
 
-        self.assertEqual(stream.call_count, 1)
+        self.assertEqual(stream.call_count, 2)
         self.assertEqual(events[-1]["response"]["output"][0]["content"][0]["text"], "README.md is present")
 
     def test_conversation_cursor_is_captured_and_reused_in_payload(self) -> None:

@@ -227,7 +227,7 @@ class CodexAlphaSearchTests(unittest.TestCase):
                     "search_query:[{q:'current OpenAI news'}]}); text(result);"
                 ),
             }),
-            json.dumps({"action": "final", "text": "OpenAI published an update."}),
+            json.dumps({"action": "final", "text": "OpenAI published an update.", "complete": True}),
         ])
 
         def fake_controller_stream(_backend, _request):
