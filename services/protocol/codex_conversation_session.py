@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 from services.account_service import account_service
 from services.model_service import normalize_model_identifier
-from services.protocol import codex_tool_bridge
+from services.protocol import codex_response_text, codex_tool_bridge
 
 
 SESSION_TTL_SECONDS = 2 * 60 * 60
@@ -35,6 +35,7 @@ class ContinuationPlan:
     usage: dict[str, Any] = field(default_factory=dict)
     canonical_input_items: list[Any] = field(default_factory=list)
     prior_output_items: list[dict[str, Any]] = field(default_factory=list)
+    upstream_wire_bytes: int = 0
 
 
 @dataclass
@@ -42,6 +43,8 @@ class _Session:
     generation: int
     model: str
     instructions_signature: str
+    text_signature: str
+    parallel_tool_calls: bool
     tools: list[dict[str, Any]]
     input_items: list[Any]
     output_items: list[dict[str, Any]]
@@ -52,6 +55,8 @@ class _Session:
     usage: dict[str, Any]
     session_id: str
     turn_id: str
+    window_id: str
+    upstream_wire_bytes: int
     last_request_signature: str
     updated_at: float = field(default_factory=time.monotonic)
 
@@ -66,7 +71,18 @@ def _model_signature(value: object) -> str:
 
 def _client_metadata(body: dict[str, Any]) -> dict[str, Any]:
     value = body.get("client_metadata")
-    return value if isinstance(value, dict) else {}
+    metadata = dict(value) if isinstance(value, dict) else {}
+    nested = metadata.get("x-codex-turn-metadata")
+    if isinstance(nested, str):
+        try:
+            nested_value = json.loads(nested)
+        except (TypeError, ValueError):
+            nested_value = None
+        if isinstance(nested_value, dict):
+            for key, nested_value_item in nested_value.items():
+                if key not in metadata and isinstance(nested_value_item, (str, int, float, bool)):
+                    metadata[key] = str(nested_value_item)
+    return metadata
 
 
 def _previous_response_id(body: dict[str, Any]) -> str:
@@ -81,8 +97,65 @@ def _request_signature(body: dict[str, Any]) -> str:
         "input": body.get("input"),
         "tools": body.get("tools"),
         "tool_choice": body.get("tool_choice"),
+        "parallel_tool_calls": body.get("parallel_tool_calls"),
+        "text": body.get("text"),
         "previous_response_id": _previous_response_id(body),
     })
+
+
+def _compaction_checkpoint_signatures(items: object) -> set[str]:
+    if not isinstance(items, list):
+        return set()
+    return {
+        _json_signature(item)
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower()
+        in {"compaction", "context_compaction"}
+    }
+
+
+def _instruction_update_messages(body: dict[str, Any]) -> list[dict[str, str]]:
+    instructions = body.get("instructions")
+    if instructions is None or str(instructions) == "":
+        return [{
+            "role": "system",
+            "content": (
+                "CODEX_TOP_LEVEL_INSTRUCTIONS_UPDATE\n"
+                "The current request has no top-level instructions. This replaces, and therefore "
+                "clears, the top-level instructions from the preceding response."
+            ),
+        }]
+    return [
+        {
+            "role": "system",
+            "content": (
+                "CODEX_TOP_LEVEL_INSTRUCTIONS_UPDATE\n"
+                "The following CODEX_TOP_LEVEL_INSTRUCTIONS records replace the top-level "
+                "instructions from the preceding response."
+            ),
+        },
+        *codex_tool_bridge.controller_transcript_messages({
+            "instructions": instructions,
+            "input": [],
+        }),
+    ]
+
+
+def _initial_messages_with_text_controls(
+    body: dict[str, Any],
+    full_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    controls = codex_response_text.controller_text_control_messages(body)
+    if controls and not any(
+        str(message.get("content") or "").startswith("CODEX_RESPONSE_TEXT_CONTROLS")
+        for message in full_messages
+    ):
+        # Keep the caller's full replay list in sync. openai_v1_response uses
+        # that same list if a retained Web cursor must be rebuilt after a
+        # stale-cursor or 413 error.
+        full_messages.extend(controls)
+    return full_messages
 
 
 def _session_key(body: dict[str, Any]) -> str:
@@ -234,6 +307,7 @@ class _SessionStore:
         *,
         force_tool: bool,
     ) -> ContinuationPlan:
+        full_messages = _initial_messages_with_text_controls(body, full_messages)
         key = self._lookup_key(body)
         input_value = body.get("input")
         if not key or not isinstance(input_value, list):
@@ -253,13 +327,42 @@ class _SessionStore:
                     messages=full_messages,
                     canonical_input_items=copy.deepcopy(input_value),
                 )
+            incoming_checkpoints = _compaction_checkpoint_signatures(input_value)
+            retained_checkpoints = _compaction_checkpoint_signatures(session.input_items)
+            if incoming_checkpoints - retained_checkpoints:
+                # Codex replaces its history after V1/V2 remote compaction.
+                # Reusing the old ChatGPT Web cursor would silently append the
+                # compacted checkpoint to the uncompressed upstream history and
+                # immediately reproduce the same 413.
+                self._sessions.pop(key, None)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
             metadata = _client_metadata(body)
             session_id = str(metadata.get("session_id") or "").strip()
             turn_id = str(metadata.get("turn_id") or "").strip()
+            window_id = str(metadata.get("window_id") or "").strip()
+            if session.window_id and window_id and session.window_id != window_id:
+                # Codex local compaction replaces the history with a summary and
+                # advances the context window without necessarily sending a
+                # typed compaction input item. Never append that replacement to
+                # the old ChatGPT Web cursor.
+                self._sessions.pop(key, None)
+                return ContinuationPlan(
+                    key=key,
+                    messages=full_messages,
+                    canonical_input_items=copy.deepcopy(input_value),
+                )
+            # Codex can switch models (and refresh its model-specific
+            # instructions) while keeping the same thread. The upstream Web
+            # cursor is the durable conversation identity; changing these
+            # request fields must not discard the accumulated task history.
             identity_mismatch = (
-                session.model != _model_signature(body.get("model"))
-                or session.instructions_signature != _json_signature(body.get("instructions"))
-                or (session.session_id and session_id and session.session_id != session_id)
+                session.session_id
+                and session_id
+                and session.session_id != session_id
             )
             if identity_mismatch:
                 self._sessions.pop(key, None)
@@ -268,6 +371,17 @@ class _SessionStore:
                     messages=full_messages,
                     canonical_input_items=copy.deepcopy(input_value),
                 )
+
+            model_signature = _model_signature(body.get("model"))
+            instructions_signature = _json_signature(body.get("instructions"))
+            text_signature = codex_response_text.text_controls_signature(body)
+            model_changed = session.model != model_signature
+            instructions_changed = session.instructions_signature != instructions_signature
+            text_changed = session.text_signature != text_signature
+            parallel_changed = session.parallel_tool_calls != bool(body.get("parallel_tool_calls"))
+            request_context_changed = (
+                model_changed or instructions_changed or text_changed or parallel_changed
+            )
 
             request_signature = _request_signature(body)
             if session.output_items and session.last_request_signature == request_signature:
@@ -281,6 +395,7 @@ class _SessionStore:
                     usage=copy.deepcopy(session.usage),
                     canonical_input_items=copy.deepcopy(session.input_items),
                     prior_output_items=copy.deepcopy(session.output_items),
+                    upstream_wire_bytes=session.upstream_wire_bytes,
                 )
 
             previous_response_id = _previous_response_id(body)
@@ -300,16 +415,24 @@ class _SessionStore:
                 suffix = copy.deepcopy(input_value[prefix_length:])
                 canonical_input_items = copy.deepcopy(input_value)
             elif previous_response_id and previous_response_id == session.response_id:
-                # Codex may send only the new tool call/result items and link them
-                # to the prior response instead of replaying the entire input.
+                # previous_response_id is an explicit Codex delta contract. It
+                # may contain only new tool call/result items, so zero overlap
+                # is valid here.
                 overlap = _longest_history_overlap(session.input_items, input_value)
                 suffix = copy.deepcopy(input_value[overlap:])
                 canonical_input_items = copy.deepcopy(session.input_items) + copy.deepcopy(input_value[overlap:])
             elif session.session_id and session_id and session.session_id == session_id:
-                # Some Codex builds omit previous_response_id but keep a stable
-                # client session. Treat the request as a delta rather than
-                # dropping the task context when its input is shorter.
+                # Without previous_response_id, only a strict prefix/full
+                # history is safe. A non-overlapping short input is a history
+                # replacement (common after local compaction), not a delta.
                 overlap = _longest_history_overlap(session.input_items, input_value)
+                if not overlap and input_value:
+                    self._sessions.pop(key, None)
+                    return ContinuationPlan(
+                        key=key,
+                        messages=full_messages,
+                        canonical_input_items=copy.deepcopy(input_value),
+                    )
                 suffix = copy.deepcopy(input_value[overlap:])
                 canonical_input_items = copy.deepcopy(session.input_items) + copy.deepcopy(input_value[overlap:])
             else:
@@ -321,7 +444,7 @@ class _SessionStore:
                 )
 
             suffix, replayed_items = _drop_replayed_output_items(suffix, session.output_items)
-            if not suffix:
+            if not suffix and not request_context_changed:
                 if (not turn_id or turn_id == session.turn_id) and session.output_items:
                     return ContinuationPlan(
                         key=key,
@@ -333,6 +456,7 @@ class _SessionStore:
                         usage=copy.deepcopy(session.usage),
                         canonical_input_items=canonical_input_items,
                         prior_output_items=copy.deepcopy(session.output_items),
+                        upstream_wire_bytes=session.upstream_wire_bytes,
                     )
                 self._sessions.pop(key, None)
                 return ContinuationPlan(
@@ -348,6 +472,15 @@ class _SessionStore:
                 return ContinuationPlan(key=key, messages=full_messages)
             changed_tools = _changed_tools(session.tools, tools)
             messages = codex_tool_bridge.controller_tool_messages(changed_tools)
+            if instructions_changed:
+                messages.extend(_instruction_update_messages(body))
+            messages.extend(codex_response_text.controller_text_control_messages(
+                body,
+                include_clear=text_changed,
+            ))
+            messages.extend(codex_tool_bridge.controller_parallel_tool_state_messages(
+                bool(body.get("parallel_tool_calls"))
+            ))
             messages.extend(codex_tool_bridge.controller_task_contract_messages(canonical_input_items))
             messages.extend(codex_tool_bridge.controller_task_anchor_messages(canonical_input_items))
             seed_calls = _tool_call_seed(session.output_items)
@@ -374,6 +507,7 @@ class _SessionStore:
                 delta_input_items=len(suffix),
                 canonical_input_items=canonical_input_items,
                 prior_output_items=copy.deepcopy(session.output_items),
+                upstream_wire_bytes=session.upstream_wire_bytes,
             )
 
     def commit(
@@ -388,6 +522,7 @@ class _SessionStore:
         access_token: str,
         response_id: str,
         usage: dict[str, Any],
+        upstream_wire_bytes: int = 0,
     ) -> bool:
         input_value = body.get("input")
         if not isinstance(input_value, list) or not conversation_id or not parent_message_id or not access_token:
@@ -412,6 +547,8 @@ class _SessionStore:
                 generation=generation,
                 model=_model_signature(body.get("model")),
                 instructions_signature=_json_signature(body.get("instructions")),
+                text_signature=codex_response_text.text_controls_signature(body),
+                parallel_tool_calls=bool(body.get("parallel_tool_calls")),
                 tools=copy.deepcopy(tools),
                 input_items=canonical_input_items,
                 output_items=copy.deepcopy(output_items),
@@ -422,6 +559,8 @@ class _SessionStore:
                 usage=copy.deepcopy(usage),
                 session_id=str(metadata.get("session_id") or "").strip(),
                 turn_id=str(metadata.get("turn_id") or "").strip(),
+                window_id=str(metadata.get("window_id") or "").strip(),
+                upstream_wire_bytes=max(0, int(upstream_wire_bytes)),
                 last_request_signature=_request_signature(body),
                 updated_at=now,
             )
@@ -460,6 +599,13 @@ class _SessionStore:
         ]
         for key in expired:
             self._sessions.pop(key, None)
+        if expired:
+            expired_keys = set(expired)
+            self._response_keys = {
+                response: mapped_key
+                for response, mapped_key in self._response_keys.items()
+                if mapped_key not in expired_keys
+            }
 
 
 _sessions = _SessionStore()
@@ -486,6 +632,7 @@ def commit_controller_response(
     access_token: str,
     response_id: str,
     usage: dict[str, Any],
+    upstream_wire_bytes: int = 0,
 ) -> bool:
     return _sessions.commit(
         plan,
@@ -497,6 +644,7 @@ def commit_controller_response(
         access_token=access_token,
         response_id=response_id,
         usage=usage,
+        upstream_wire_bytes=upstream_wire_bytes,
     )
 
 

@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from services.protocol import openai_search
-from services.protocol.web_search_tool import clean_search_text
+from services.protocol.web_search_tool import WebSearchConstraintError, clean_search_text
 from utils.helper import extract_response_prompt
 
 
@@ -28,6 +28,16 @@ SEARCH_COMMAND_KEYS = (
 )
 REFERENCE_COMMAND_KEYS = ("open", "find")
 UNSUPPORTED_COMMAND_KEYS = ("click", "screenshot")
+SEARCH_SETTING_FIELDS = {
+    "user_location",
+    "search_context_size",
+    "filters",
+    "image_settings",
+    "allowed_callers",
+    "external_web_access",
+}
+SEARCH_CONTEXT_SIZES = {"low", "medium", "high"}
+SEARCH_ALLOWED_CALLERS = {"direct", "shell", "code_interpreter"}
 SEARCH_SESSION_TTL_SECONDS = 30 * 60
 SEARCH_SESSION_MAX_ENTRIES = 256
 
@@ -141,8 +151,90 @@ def _meaningful_commands(value: object) -> dict[str, Any]:
     return commands
 
 
+def _constraint_error(param: str, reason: str) -> WebSearchConstraintError:
+    return WebSearchConstraintError(
+        f"The ChatGPT Web compatibility search backend cannot honor {param}: {reason}.",
+        param,
+    )
+
+
+def _validate_search_constraints(body: dict[str, Any]) -> str:
+    commands = body.get("commands")
+    if isinstance(commands, dict):
+        image_queries = commands.get("image_query")
+        if isinstance(image_queries, list) and image_queries:
+            raise _constraint_error(
+                "commands.image_query",
+                "the available upstream returns text and URL sources, not Codex image search results",
+            )
+        search_queries = commands.get("search_query")
+        if isinstance(search_queries, list):
+            for index, query in enumerate(search_queries):
+                if not isinstance(query, dict) or "domains" not in query:
+                    continue
+                domains = query.get("domains")
+                if domains in (None, []):
+                    continue
+                raise _constraint_error(
+                    f"commands.search_query[{index}].domains",
+                    "the available upstream cannot enforce a source-domain allowlist before retrieval",
+                )
+
+    settings = body.get("settings")
+    if settings is None:
+        return ""
+    if not isinstance(settings, dict):
+        raise _constraint_error("settings", "the value must be an object")
+    unknown_fields = sorted(set(settings) - SEARCH_SETTING_FIELDS)
+    if unknown_fields:
+        raise _constraint_error(
+            f"settings.{unknown_fields[0]}",
+            "this field is not supported and would otherwise be ignored",
+        )
+
+    external_access = settings.get("external_web_access")
+    if external_access not in (None, True, "live"):
+        if external_access not in (False, "cached", "indexed"):
+            raise _constraint_error(
+                "settings.external_web_access",
+                "the value must be true, false, live, cached, or indexed",
+            )
+        raise _constraint_error(
+            "settings.external_web_access",
+            f"{external_access!r} requires a restricted retrieval mode, but the available upstream always performs live web search",
+        )
+
+    allowed_callers = settings.get("allowed_callers")
+    if allowed_callers is not None:
+        if not isinstance(allowed_callers, list) or any(
+            not isinstance(caller, str) or caller not in SEARCH_ALLOWED_CALLERS
+            for caller in allowed_callers
+        ):
+            raise _constraint_error(
+                "settings.allowed_callers",
+                "the value must contain only direct, shell, or code_interpreter",
+            )
+
+    context_size = settings.get("search_context_size")
+    if context_size is not None and context_size not in SEARCH_CONTEXT_SIZES:
+        raise _constraint_error(
+            "settings.search_context_size",
+            "the value must be low, medium, or high",
+        )
+
+    for field, reason in (
+        ("filters", "domain allowlists and blocklists cannot be enforced before retrieval"),
+        ("user_location", "the available upstream does not accept a per-request search location"),
+        ("image_settings", "the available upstream does not expose Codex image search results"),
+    ):
+        if settings.get(field) not in (None, {}, []):
+            raise _constraint_error(f"settings.{field}", reason)
+    return str(context_size or "")
+
+
 def request_prompt(body: dict[str, Any]) -> str:
     """Build the ChatGPT Web search prompt for Codex's alpha/search request."""
+    context_size = _validate_search_constraints(body)
     raw_commands = body.get("commands")
     commands = _meaningful_commands(raw_commands)
     if isinstance(raw_commands, dict) and not any(key in commands for key in SEARCH_COMMAND_KEYS):
@@ -160,6 +252,11 @@ def request_prompt(body: dict[str, Any]) -> str:
     if context:
         parts.append(
             "Recent request context (use it only to resolve references such as turn0search0):\n" + context
+        )
+    if context_size:
+        parts.append(
+            "Search context size requested by Codex: "
+            f"{context_size}. Keep the result breadth and detail consistent with that level."
         )
     if isinstance(input_value, (dict, list)):
         parts.append(

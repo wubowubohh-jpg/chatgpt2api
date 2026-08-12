@@ -254,6 +254,32 @@ class LoggedCall:
             sender = responses_sse_stream
         else:
             sender = sse_json_stream
+        if sse == "responses":
+            payload = args[0] if args and isinstance(args[0], dict) else {}
+            response_id = str(payload.get("_response_id") or "").strip()
+            metadata = payload.get("client_metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            # Codex treats this as an opaque routing token. Echo the client
+            # token on continuations; create a separate token on the first
+            # request instead of conflating it with response_id.
+            turn_state = str(metadata.get("turn_state") or "").strip() or f"turn_{uuid4().hex}"
+            response_headers = {
+                "cache-control": "no-cache",
+                "x-accel-buffering": "no",
+                "openai-model": self.model,
+                "x-models-etag": '"chatgpt2api-codex-models-v1"',
+                "x-codex-turn-state": turn_state,
+            }
+            if response_id:
+                response_headers["x-request-id"] = response_id
+            # Do not prefetch the generator here. Responses emits its own
+            # structured failure event, and returning StreamingResponse first
+            # lets its heartbeat cover backend/account initialization too.
+            return StreamingResponse(
+                sender(self.stream(result)),
+                media_type="text/event-stream",
+                headers=response_headers,
+            )
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
@@ -268,10 +294,19 @@ class LoggedCall:
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
+        response_headers: dict[str, str] = {}
         if not has_first:
             self.log("流式调用结束")
-            return StreamingResponse(sender(()), media_type="text/event-stream")
-        return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+            return StreamingResponse(
+                sender(()),
+                media_type="text/event-stream",
+                headers=response_headers,
+            )
+        return StreamingResponse(
+            sender(self.stream(itertools.chain([first], result))),
+            media_type="text/event-stream",
+            headers=response_headers,
+        )
 
     def stream(self, items):
         urls: list[str] = []

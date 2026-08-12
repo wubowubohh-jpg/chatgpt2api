@@ -119,7 +119,12 @@ class MultiImageResultTests(unittest.TestCase):
         ])
 
         with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.5}),
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_poll_interval_secs": 0.5,
+                "image_check_before_hit_enabled": True,
+                "image_settle_enabled": True,
+            }),
             mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
         ):
             file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
@@ -170,8 +175,12 @@ class MultiImageResultTests(unittest.TestCase):
         ))
 
         done_events = [event for event in events if event.get("type") == "response.output_item.done"]
+        added_events = [event for event in events if event.get("type") == "response.output_item.added"]
         completed = next(event["response"] for event in events if event.get("type") == "response.completed")
 
+        self.assertEqual([event["output_index"] for event in added_events], [0, 1])
+        self.assertTrue(all(event["item"]["status"] == "in_progress" for event in added_events))
+        self.assertTrue(all("result" not in event["item"] for event in added_events))
         self.assertEqual([event["output_index"] for event in done_events], [0, 1])
         self.assertEqual([item["result"] for item in completed["output"]], [first, second])
 

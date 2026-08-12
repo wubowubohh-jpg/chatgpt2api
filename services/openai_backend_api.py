@@ -23,7 +23,14 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    UpstreamHTTPError,
+    current_stream_cancellation,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -2609,10 +2616,14 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
+        cancellation = current_stream_cancellation()
+        registration = cancellation.register(response.close) if cancellation is not None else 0
         try:
+            ensure_ok(response, path)
             yield from iter_sse_payloads(response)
         finally:
+            if cancellation is not None:
+                cancellation.unregister(registration)
             response.close()
 
     def _report_progress(self, step: str) -> None:

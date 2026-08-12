@@ -288,6 +288,42 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(first, second)
 
+    def test_cached_responses_rewrites_envelope_to_current_request_id(self) -> None:
+        calls = 0
+
+        def fake_stream_text_deltas(_backend, _request):
+            nonlocal calls
+            calls += 1
+            yield "cached response"
+
+        first_body = {
+            "model": "auto",
+            "input": "cache this response identity",
+            "stream": True,
+            "_response_id": "resp_first",
+        }
+        second_body = {**first_body, "_response_id": "resp_second"}
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch(
+                "services.protocol.openai_v1_response.stream_text_deltas",
+                side_effect=fake_stream_text_deltas,
+            ),
+        ):
+            first = list(openai_v1_response.handle(first_body))
+            second = list(openai_v1_response.handle(second_body))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(first[0]["response"]["id"], "resp_first")
+        self.assertEqual(first[-1]["response"]["id"], "resp_first")
+        self.assertEqual(second[0]["response"]["id"], "resp_second")
+        self.assertEqual(second[-1]["response"]["id"], "resp_second")
+        self.assertNotEqual(
+            first[-1]["response"]["output"][0]["id"],
+            second[-1]["response"]["output"][0]["id"],
+        )
+
     def test_output_sanitizer_removes_chatgpt_annotation_markup(self) -> None:
         text = (
             "Repo: \ue200url\ue202basketikun/chatgpt2api"

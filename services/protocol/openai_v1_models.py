@@ -7,6 +7,17 @@ from services.model_service import model_catalog_service, model_compatibility_en
 from utils.helper import CODEX_IMAGE_MODEL
 
 
+def list_codex_models() -> dict[str, Any]:
+    """Return the Codex wire wrapper while retaining local fallback metadata.
+
+    Codex's models manager treats an empty remote catalog as a valid response
+    and keeps its bundled model descriptors (including the built-in Codex
+    instructions and agent capability matrix). Advertising the OpenAI
+    ``data`` wrapper here would fail deserialization before Responses starts.
+    """
+    return {"models": []}
+
+
 def list_models() -> dict[str, Any]:
     result = model_catalog_service.list_models()
     data = result.get("data")

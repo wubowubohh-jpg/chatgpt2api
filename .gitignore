@@ -20,6 +20,7 @@ docker-compose-local.yml
 # Environment variables
 .env
 .env.local
+test/testToken.txt
 
 # Database files
 *.db

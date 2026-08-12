@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok"]
+    },
+    "sentinel": {
+      "type": "string",
+      "const": "CODEX_E2E_SENTINEL_9f7c2a61e84b"
+    }
+  },
+  "required": ["status", "sentinel"],
+  "additionalProperties": false
+}

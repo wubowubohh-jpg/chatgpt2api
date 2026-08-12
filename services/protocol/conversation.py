@@ -320,6 +320,9 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    # Estimated bytes appended to the current ChatGPT Web conversation by the
+    # Codex controller. This is gateway-local bookkeeping, never sent upstream.
+    controller_wire_bytes: int = 0
 
 
 @dataclass

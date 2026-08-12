@@ -2,11 +2,15 @@ import base64
 import hashlib
 import json
 import mimetypes
+import os
+import queue
 import re
+import threading
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
@@ -173,6 +177,68 @@ class UpstreamHTTPError(RuntimeError):
             body_str = body_str[:_UPSTREAM_BODY_LOG_LIMIT] + "…[truncated]"
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
+    def to_openai_error(self) -> dict[str, Any]:
+        """Expose structured upstream errors to OpenAI/Responses clients.
+
+        Codex classifies ``response.failed`` by ``error.code``.  Collapsing
+        every upstream failure into ``upstream_error`` makes fatal context and
+        quota errors look retryable and can trigger repeated identical turns.
+        """
+        candidate: Any = self.body
+        if isinstance(candidate, str):
+            try:
+                decoded = json.loads(candidate)
+            except (TypeError, ValueError):
+                decoded = None
+            if decoded is not None:
+                candidate = decoded
+        if isinstance(candidate, dict) and isinstance(candidate.get("error"), dict):
+            candidate = candidate["error"]
+        if not isinstance(candidate, dict):
+            candidate = {}
+
+        status = int(self.status_code or 0)
+        code = str(candidate.get("code") or "").strip()
+        error_type = str(candidate.get("type") or "").strip()
+        message = str(candidate.get("message") or candidate.get("detail") or "").strip()
+        if not code:
+            code = {
+                400: "invalid_request_error",
+                401: "authentication_error",
+                403: "permission_denied",
+                404: "not_found",
+                413: "context_length_exceeded",
+                429: "rate_limit_exceeded",
+            }.get(status, "server_error" if status >= 500 else "upstream_error")
+        if not error_type:
+            if code == "context_length_exceeded":
+                error_type = "invalid_request_error"
+            elif code == "insufficient_quota":
+                error_type = "insufficient_quota"
+            elif code == "rate_limit_exceeded":
+                error_type = "rate_limit_error"
+            elif status >= 500:
+                error_type = "server_error"
+            elif status == 401:
+                error_type = "authentication_error"
+            elif status == 403:
+                error_type = "permission_error"
+            else:
+                error_type = "invalid_request_error"
+        if not message:
+            message = str(self) or "upstream request failed"
+        if self.retry_after is not None and code == "rate_limit_exceeded":
+            if "try again" not in message.lower():
+                message = f"{message.rstrip('.')} Try again in {self.retry_after} seconds."
+        return {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": candidate.get("param"),
+                "code": code,
+            }
+        }
+
 
 def ensure_ok(response: requests.Response, context: str) -> None:
     if 200 <= response.status_code < 300:
@@ -209,12 +275,120 @@ def sse_json_stream(items) -> Iterator[str]:
     yield "data: [DONE]\n\n"
 
 
+class StreamCancellation:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._callbacks: dict[int, Callable[[], object]] = {}
+        self._next_id = 1
+
+    def register(self, callback: Callable[[], object]) -> int:
+        with self._lock:
+            if self._event.is_set():
+                registration = 0
+            else:
+                registration = self._next_id
+                self._next_id += 1
+                self._callbacks[registration] = callback
+        if registration == 0:
+            try:
+                callback()
+            except Exception:
+                pass
+        return registration
+
+    def unregister(self, registration: int) -> None:
+        if registration:
+            with self._lock:
+                self._callbacks.pop(registration, None)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._event.is_set():
+                return
+            self._event.set()
+            callbacks = list(self._callbacks.values())
+            self._callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+_CURRENT_STREAM_CANCELLATION: ContextVar[StreamCancellation | None] = ContextVar(
+    "chatgpt2api_stream_cancellation",
+    default=None,
+)
+
+
+def current_stream_cancellation() -> StreamCancellation | None:
+    return _CURRENT_STREAM_CANCELLATION.get()
+
+
 def responses_sse_stream(items) -> Iterator[str]:
     yield ": stream-open\n\n"
     response: dict[str, Any] = {}
     terminal = False
+
+    # Codex wraps every SSE read in an idle timeout.  A comment-only heartbeat
+    # is consumed by the SSE framing layer and does not reset that timer, so
+    # run the potentially blocking compatibility generator in a worker and
+    # emit a parser-visible Responses event while it waits on upstream work.
     try:
-        for item in items:
+        heartbeat_seconds = float(os.getenv("CHATGPT2API_RESPONSES_SSE_HEARTBEAT_SECONDS", "5"))
+    except (TypeError, ValueError):
+        heartbeat_seconds = 5.0
+    heartbeat_seconds = min(max(heartbeat_seconds, 0.05), 60.0)
+    events: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=8)
+    producer_stop = threading.Event()
+    cancellation = StreamCancellation()
+
+    def put_event(kind: str, value: object) -> bool:
+        while not producer_stop.is_set():
+            try:
+                events.put((kind, value), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        cancellation_token = _CURRENT_STREAM_CANCELLATION.set(cancellation)
+        try:
+            for value in items:
+                if not put_event("item", value):
+                    return
+        except Exception as exc:  # noqa: BLE001 - surfaced by the consumer below
+            put_event("error", exc)
+        finally:
+            put_event("done", None)
+            _CURRENT_STREAM_CANCELLATION.reset(cancellation_token)
+
+    producer = threading.Thread(
+        target=produce,
+        name="responses-sse-source",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        while True:
+            try:
+                kind, value = events.get(timeout=heartbeat_seconds)
+            except queue.Empty:
+                if not terminal:
+                    heartbeat = {
+                        "type": "response.in_progress",
+                    }
+                    yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
+                continue
+            if kind == "done":
+                break
+            if kind == "error":
+                if isinstance(value, Exception):
+                    raise value
+                raise RuntimeError(str(value))
+            item = value
             if isinstance(item, dict):
                 event_type = str(item.get("type") or "")
                 if event_type == "response.created" and isinstance(item.get("response"), dict):
@@ -222,6 +396,8 @@ def responses_sse_stream(items) -> Iterator[str]:
                 if event_type in {"response.completed", "response.failed", "response.incomplete"}:
                     terminal = True
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            if terminal:
+                break
     except Exception as exc:
         logger.warning({
             "event": "responses_sse_stream_error",
@@ -243,6 +419,22 @@ def responses_sse_stream(items) -> Iterator[str]:
                     "The Codex compatibility request is larger than the ChatGPT Web conversation "
                     "endpoint accepts. Start a new turn or reduce non-instruction tool output."
                 )
+            elif isinstance(exc, UpstreamHTTPError) and exc.status_code in {400, 401, 403, 404, 422}:
+                codex_fatal_codes = {
+                    "context_length_exceeded",
+                    "insufficient_quota",
+                    "usage_not_included",
+                    "cyber_policy",
+                    "invalid_prompt",
+                    "bio_policy",
+                }
+                if code not in codex_fatal_codes:
+                    # Codex treats unknown response.failed codes as retryable.
+                    # These status codes are deterministic at this gateway, so
+                    # expose the fatal code Codex recognizes and keep the real
+                    # upstream message for diagnosis.
+                    code = "invalid_prompt"
+                    error_type = "invalid_request_error"
             failed_response = {
                 "id": str(response.get("id") or f"resp_{uuid.uuid4().hex}"),
                 "object": "response",
@@ -260,6 +452,17 @@ def responses_sse_stream(items) -> Iterator[str]:
             event = {"type": "response.failed", "response": failed_response}
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             terminal = True
+    finally:
+        producer_stop.set()
+        cancellation.cancel()
+        producer.join(timeout=1.0)
+        if not producer.is_alive():
+            close = getattr(items, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
     if not terminal:
         failed_response = {
             "id": str(response.get("id") or f"resp_{uuid.uuid4().hex}"),

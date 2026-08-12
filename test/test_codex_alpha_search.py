@@ -77,7 +77,7 @@ class CodexAlphaSearchTests(unittest.TestCase):
         body = {
             "id": "search-session",
             "model": "gpt-5.6-luna",
-            "commands": {"search_query": [{"q": "OpenAI news", "domains": ["openai.com"]}]},
+            "commands": {"search_query": [{"q": "OpenAI news"}]},
             "max_output_tokens": 1000,
         }
         result = {
@@ -93,6 +93,43 @@ class CodexAlphaSearchTests(unittest.TestCase):
         self.assertIn("OpenAI news", search.call_args.args[0]["prompt"])
         self.assertEqual(response["encrypted_output"], None)
         self.assertEqual(response["_account_email"], "account@example.com")
+
+    def test_restricted_search_modes_and_filters_fail_before_upstream(self) -> None:
+        constrained = [
+            {"settings": {"external_web_access": False}},
+            {"settings": {"external_web_access": "cached"}},
+            {"settings": {"external_web_access": "indexed"}},
+            {"settings": {"filters": {"allowed_domains": ["openai.com"]}}},
+            {"settings": {"user_location": {"type": "approximate", "country": "US"}}},
+            {"settings": {"image_settings": {"max_results": 3}}},
+            {"commands": {"search_query": [{"q": "news", "domains": ["openai.com"]}]}},
+            {"commands": {"image_query": [{"q": "OpenAI logo"}]}},
+        ]
+
+        with mock.patch("services.protocol.codex_search.openai_search.handle") as search:
+            for extra in constrained:
+                with self.subTest(extra=extra), self.assertRaisesRegex(Exception, "cannot honor"):
+                    codex_search.handle({
+                        "commands": {"search_query": [{"q": "current news"}]},
+                        **extra,
+                    })
+
+        search.assert_not_called()
+
+    def test_live_search_context_size_is_preserved(self) -> None:
+        body = {
+            "commands": {"search_query": [{"q": "current news"}]},
+            "settings": {
+                "external_web_access": "live",
+                "allowed_callers": ["direct"],
+                "search_context_size": "high",
+            },
+        }
+
+        prompt = codex_search.request_prompt(body)
+
+        self.assertIn("Search context size requested by Codex: high", prompt)
+        self.assertIn('"external_web_access":"live"', prompt)
 
     def test_session_reference_is_resolved_for_a_follow_up_open(self) -> None:
         first_result = {

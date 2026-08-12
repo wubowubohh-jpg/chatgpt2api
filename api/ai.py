@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, Request
+import json
+import uuid
+
+from fastapi import APIRouter, Header, HTTPException, Request, WebSocket
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
@@ -18,6 +21,8 @@ from services.protocol import (
     openai_v1_image_generations,
     openai_v1_models,
     openai_v1_response,
+    codex_memories,
+    codex_files,
     openai_search,
 )
 
@@ -81,6 +86,48 @@ class EditableFileTaskRequest(BaseModel):
     client_task_id: str | None = None
 
 
+def merge_responses_request_identity(payload: dict[str, object], request: Request) -> None:
+    """Keep Codex session identity when a proxy sends it only as HTTP headers."""
+    metadata_value = payload.get("client_metadata")
+    metadata = dict(metadata_value) if isinstance(metadata_value, dict) else {}
+
+    nested_values = [metadata.get("x-codex-turn-metadata"), request.headers.get("x-codex-turn-metadata")]
+    for nested in nested_values:
+        if not isinstance(nested, str):
+            continue
+        try:
+            nested_value = json.loads(nested)
+        except (TypeError, ValueError):
+            nested_value = None
+        if isinstance(nested_value, dict):
+            for key, value in nested_value.items():
+                if key not in metadata and isinstance(value, (str, int, float, bool)):
+                    metadata[key] = str(value)
+
+    header_aliases = {
+        "session-id": "session_id",
+        "thread-id": "thread_id",
+        "x-client-request-id": "thread_id",
+        "x-codex-installation-id": "installation_id",
+        "x-codex-routing-hint": "routing_hint",
+        "x-codex-window-id": "window_id",
+        "x-codex-turn-id": "turn_id",
+        "x-codex-turn-state": "turn_state",
+        "x-codex-parent-thread-id": "parent_thread_id",
+        "x-openai-subagent": "subagent_header",
+    }
+    for header_name, metadata_name in header_aliases.items():
+        value = str(request.headers.get(header_name) or "").strip()
+        if value and not str(metadata.get(metadata_name) or "").strip():
+            metadata[metadata_name] = value
+
+    session_id = str(metadata.get("session_id") or "").strip()
+    if session_id and not str(payload.get("prompt_cache_key") or "").strip():
+        payload["prompt_cache_key"] = session_id
+    if metadata:
+        payload["client_metadata"] = metadata
+
+
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -92,10 +139,23 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 def create_router() -> APIRouter:
     router = APIRouter()
 
+    @router.get("/models")
     @router.get("/v1/models")
-    async def list_models(authorization: str | None = Header(default=None)):
+    async def list_models(
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
         require_identity(authorization)
         try:
+            # Codex appends client_version and expects ModelsResponse, whose
+            # wire key is ``models``. Keep the normal OpenAI ``data`` catalog
+            # for all other clients.
+            if request.query_params.get("client_version") is not None:
+                payload = await run_in_threadpool(openai_v1_models.list_codex_models)
+                return JSONResponse(
+                    content=payload,
+                    headers={"etag": '"chatgpt2api-codex-models-v1"'},
+                )
             return await run_in_threadpool(openai_v1_models.list_models)
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
@@ -147,10 +207,17 @@ def create_router() -> APIRouter:
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
 
+    @router.post("/responses")
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(
+            body: ResponseCreateRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        merge_responses_request_identity(payload, request)
+        payload["_response_id"] = f"resp_{uuid.uuid4().hex}"
         # Keep controller-session state isolated when clients reuse a prompt cache key.
         payload["_request_identity_key_id"] = str(identity.get("id") or "anonymous")
         model = str(payload.get("model") or "auto")
@@ -165,6 +232,158 @@ def create_router() -> APIRouter:
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload, sse="responses")
+
+    @router.post("/responses/compact")
+    @router.post("/v1/responses/compact")
+    async def compact_response(
+            body: ResponseCreateRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        payload = body.model_dump(mode="python")
+        merge_responses_request_identity(payload, request)
+        payload["_request_identity_key_id"] = str(identity.get("id") or "anonymous")
+        model = str(payload.get("model") or "auto")
+        request_preview = request_text(payload.get("input"), payload.get("instructions"))
+        call = LoggedCall(
+            identity,
+            "/v1/responses/compact",
+            model,
+            "Responses compact",
+            request_text=request_preview,
+            request_shape=request_shape(payload.get("input")),
+        )
+        await filter_or_log(call, request_preview)
+        result = await call.run(openai_v1_response.compact, payload)
+        metadata = payload.get("client_metadata") if isinstance(payload.get("client_metadata"), dict) else {}
+        turn_state = str(metadata.get("turn_state") or "").strip()
+        if isinstance(result, dict) and turn_state:
+            return JSONResponse(content=result, headers={"x-codex-turn-state": turn_state})
+        return result
+
+    @router.post("/memories/trace_summarize")
+    @router.post("/v1/memories/trace_summarize")
+    async def summarize_memories(
+            body: codex_memories.MemorySummarizeRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        payload = body.model_dump(mode="python")
+        model = str(payload.get("model") or "auto")
+        request_preview = request_text(payload.get("traces"), payload.get("reasoning"))
+        call = LoggedCall(
+            identity,
+            "/v1/memories/trace_summarize",
+            model,
+            "Codex memory summarize",
+            request_text=request_preview,
+        )
+        await filter_or_log(call, request_preview)
+        return await call.run(codex_memories.handle, payload)
+
+    @router.post("/files")
+    @router.post("/v1/files")
+    async def create_codex_file(
+            payload: dict[str, object],
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        require_identity(authorization)
+        try:
+            record = codex_files.codex_file_store.create(
+                payload.get("file_name"),
+                payload.get("file_size"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        base_url = resolve_image_base_url(request).rstrip("/")
+        return {
+            "file_id": record.file_id,
+            "upload_url": f"{base_url}/v1/files/{record.file_id}/upload/{record.upload_token}",
+        }
+
+    @router.put("/files/{file_id}/upload/{upload_token}")
+    @router.put("/v1/files/{file_id}/upload/{upload_token}")
+    async def upload_codex_file(file_id: str, upload_token: str, request: Request):
+        record = codex_files.codex_file_store.get_for_upload(file_id, upload_token)
+        if record is None:
+            raise HTTPException(status_code=404, detail={"error": "file upload target not found"})
+        declared_length = request.headers.get("content-length")
+        if declared_length:
+            try:
+                if int(declared_length) > record.file_size:
+                    codex_files.codex_file_store.discard_upload(record)
+                    raise HTTPException(status_code=413, detail={"error": "file exceeds declared size"})
+            except ValueError:
+                raise HTTPException(status_code=400, detail={"error": "invalid content-length"})
+        total = 0
+        try:
+            with record.path.open("wb") as output:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > record.file_size:
+                        raise HTTPException(status_code=413, detail={"error": "file exceeds declared size"})
+                    output.write(chunk)
+        except HTTPException:
+            codex_files.codex_file_store.discard_upload(record)
+            raise
+        except OSError as exc:
+            codex_files.codex_file_store.discard_upload(record)
+            raise HTTPException(status_code=500, detail={"error": "file upload could not be stored"}) from exc
+        return Response(status_code=201)
+
+    @router.post("/files/{file_id}/uploaded")
+    @router.post("/v1/files/{file_id}/uploaded")
+    async def finalize_codex_file(
+            file_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        require_identity(authorization)
+        record = codex_files.codex_file_store.get(file_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail={"error": "file not found"})
+        if record.uploaded:
+            status = "success"
+        else:
+            try:
+                uploaded_bytes = record.path.stat().st_size
+            except OSError:
+                return {"status": "retry"}
+            record, error = codex_files.codex_file_store.mark_uploaded(file_id, uploaded_bytes)
+            if error:
+                return {"status": "error", "error_message": error}
+            status = "success"
+        base_url = resolve_image_base_url(request).rstrip("/")
+        return {
+            "status": status,
+            "download_url": f"{base_url}/v1/files/{record.file_id}/download/{record.download_token}",
+            "file_name": record.file_name,
+            "mime_type": record.mime_type,
+        }
+
+    @router.get("/files/{file_id}/download/{download_token}")
+    @router.get("/v1/files/{file_id}/download/{download_token}")
+    async def download_codex_file(file_id: str, download_token: str):
+        record = codex_files.codex_file_store.get_for_download(file_id, download_token)
+        if record is None or not record.path.is_file():
+            raise HTTPException(status_code=404, detail={"error": "file not found"})
+        return FileResponse(record.path, media_type=record.mime_type, filename=record.file_name)
+
+    @router.websocket("/responses")
+    @router.websocket("/v1/responses")
+    async def reject_responses_websocket(websocket: WebSocket):
+        """Tell Codex to use its HTTP Responses transport instead of a missing WS bridge."""
+        denial = Response(
+            status_code=426,
+            headers={"connection": "Upgrade", "upgrade": "websocket"},
+        )
+        try:
+            await websocket.send_denial_response(denial)
+        except (AttributeError, RuntimeError):
+            # Older ASGI servers do not expose the denial-response extension.
+            await websocket.close(code=1000, reason="Responses WebSocket is not supported")
 
     @router.post("/v1/messages")
     async def create_message(
