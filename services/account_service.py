@@ -18,7 +18,26 @@ from services.log_service import (
     log_service,
 )
 from services.storage.base import StorageBackend
-from utils.helper import anonymize_token
+from utils.helper import UpstreamHTTPError, anonymize_token
+
+
+class TextAccountPoolRateLimited(UpstreamHTTPError):
+    """Raised when every compatible text account is in a transient cooldown."""
+
+    def __init__(self, retry_after: int) -> None:
+        wait_seconds = max(1, int(retry_after))
+        super().__init__(
+            "text account pool",
+            429,
+            {
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "type": "rate_limit_error",
+                    "message": "All compatible text accounts are temporarily rate limited.",
+                }
+            },
+            retry_after=wait_seconds,
+        )
 
 
 class AccountService:
@@ -38,6 +57,8 @@ class AccountService:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/145.0.0.0 Safari/537.36"
     )
+    _TEXT_RATE_LIMIT_DEFAULT_SECONDS = 30
+    _TEXT_RATE_LIMIT_MAX_SECONDS = 15 * 60
 
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
@@ -54,6 +75,11 @@ class AccountService:
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        # Text rate limits are independent from the persisted image quota.
+        # Keep them process-local so a transient 429 cannot permanently disable
+        # an otherwise healthy account after a restart.
+        self._text_rate_limited_until: dict[str, float] = {}
+        self._text_rate_limit_failures: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -1010,7 +1036,13 @@ class AccountService:
 
             route = model_catalog_service.route_for_model(requested_model)
         with self._lock:
-            candidates = [
+            now = time.monotonic()
+            self._text_rate_limited_until = {
+                token: deadline
+                for token, deadline in self._text_rate_limited_until.items()
+                if deadline > now
+            }
+            eligible = [
                 token
                 for account in self._accounts.values()
                 if account.get("status") not in {"禁用", "异常"}
@@ -1021,7 +1053,21 @@ class AccountService:
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]
+            candidates = [
+                token
+                for token in eligible
+                if self._text_rate_limited_until.get(token, 0.0) <= now
+            ]
             if not candidates:
+                cooling_deadlines = [
+                    self._text_rate_limited_until[token]
+                    for token in eligible
+                    if self._text_rate_limited_until.get(token, 0.0) > now
+                ]
+                if cooling_deadlines:
+                    raise TextAccountPoolRateLimited(
+                        max(1, int(min(cooling_deadlines) - now + 0.999))
+                    )
                 if route is None or route.allow_anonymous:
                     return ""
                 from services.model_service import ModelUnavailableError
@@ -1033,11 +1079,40 @@ class AccountService:
             self._index += 1
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
+    def mark_text_rate_limited(
+        self,
+        access_token: str,
+        retry_after: int | None = None,
+    ) -> int:
+        """Temporarily remove one account from text rotation after an upstream 429."""
+        if not access_token:
+            return 0
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            if access_token not in self._accounts:
+                return 0
+            failures = int(self._text_rate_limit_failures.get(access_token, 0)) + 1
+            self._text_rate_limit_failures[access_token] = failures
+            if retry_after is None:
+                seconds = self._TEXT_RATE_LIMIT_DEFAULT_SECONDS * (2 ** min(failures - 1, 4))
+            else:
+                seconds = max(1, int(retry_after))
+            seconds = min(seconds, self._TEXT_RATE_LIMIT_MAX_SECONDS)
+            self._text_rate_limited_until[access_token] = time.monotonic() + seconds
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "文本账号暂时限流",
+            {"token": anonymize_token(access_token), "retry_after": seconds},
+        )
+        return seconds
+
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
+            self._text_rate_limited_until.pop(access_token, None)
+            self._text_rate_limit_failures.pop(access_token, None)
             current = self._accounts.get(access_token)
             if current is None:
                 return

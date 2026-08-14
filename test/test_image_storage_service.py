@@ -76,6 +76,21 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
 
+    def test_prompt_metadata_is_persisted_and_listed(self):
+        stored = self.service().save(
+            png_bytes(),
+            "http://app.test",
+            prompt="A red square",
+            revised_prompt="A polished red square on white",
+        )
+
+        items = self.service().list_items("http://app.test")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["rel"], stored.rel)
+        self.assertEqual(items[0]["prompt"], "A red square")
+        self.assertEqual(items[0]["revised_prompt"], "A polished red square on white")
+
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({
             "enabled": True,

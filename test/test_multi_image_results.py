@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import base64
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import ImageOutput, extract_conversation_ids, format_image_result
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -50,6 +51,27 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_format_image_result_saves_prompt_metadata(self) -> None:
+        encoded = base64.b64encode(b"image-bytes").decode("ascii")
+        with mock.patch(
+            "services.protocol.conversation.image_storage_service.save",
+            return_value=SimpleNamespace(url="http://app.test/images/result.png"),
+        ) as save:
+            result = format_image_result(
+                [{"b64_json": encoded, "revised_prompt": "A polished red square"}],
+                "A red square",
+                "url",
+                "http://app.test",
+            )
+
+        self.assertEqual(result["data"][0]["url"], "http://app.test/images/result.png")
+        save.assert_called_once_with(
+            b"image-bytes",
+            "http://app.test",
+            prompt="A red square",
+            revised_prompt="A polished red square",
+        )
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '

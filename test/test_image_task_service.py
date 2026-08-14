@@ -99,6 +99,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                 base_url="http://local.test",
             )
             wait_for_task(service, OWNER, "persisted-task", "success")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["tasks"][0]["prompt"], "cat")
 
             reloaded = self.make_service(path)
             result = reloaded.list_tasks(OWNER, ["persisted-task"])

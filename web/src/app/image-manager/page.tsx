@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, MessageSquareText, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
@@ -67,6 +67,7 @@ function ImageManagerContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [deleteStartDate, setDeleteStartDate] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<ManagedImage | null>(null);
+  const [promptTarget, setPromptTarget] = useState<ManagedImage | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [allTags, setAllTags] = useState<string[]>([]);
   const [storage, setStorage] = useState<ImageStorageStats | null>(null);
@@ -111,6 +112,8 @@ function ImageManagerContent() {
   const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
+  const targetPrompt = promptTarget?.prompt?.trim() ?? "";
+  const targetRevisedPrompt = promptTarget?.revised_prompt?.trim() ?? "";
 
   const loadImages = async () => {
     setIsLoading(true);
@@ -266,6 +269,15 @@ function ImageManagerContent() {
 
   const handleSingleDownload = async (item: ManagedImage) => {
     await downloadSingleImage(item.rel);
+  };
+
+  const copyPrompt = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(`${label}已复制`);
+    } catch {
+      toast.error("复制失败");
+    }
   };
 
   useEffect(() => {
@@ -511,6 +523,18 @@ function ImageManagerContent() {
                   >
                     <Trash2 className="size-3.5" />
                   </button>
+                  <button
+                    type="button"
+                    className="absolute top-2 left-2 z-10 inline-flex size-7 items-center justify-center rounded-full bg-black/50 text-white opacity-100 transition hover:bg-black/70 sm:opacity-0 sm:group-hover:opacity-100"
+                    title={item.prompt || item.revised_prompt ? "查看提示词" : "暂无提示词记录"}
+                    aria-label={item.prompt || item.revised_prompt ? "查看提示词" : "暂无提示词记录"}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setPromptTarget(item);
+                    }}
+                  >
+                    <MessageSquareText className="size-3.5" />
+                  </button>
                 </div>
                 <div className="mt-3 space-y-2 text-xs text-stone-500">
                   <div className="flex items-center justify-between gap-2">
@@ -663,6 +687,71 @@ function ImageManagerContent() {
             <Button variant="destructive" onClick={() => void handleDelete()} disabled={isDeleting} className="rounded-xl">
               {isDeleting ? <LoaderCircle className="mr-1 size-4 animate-spin" /> : <Trash2 className="mr-1 size-4" />}
               删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(promptTarget)} onOpenChange={(open) => { if (!open) setPromptTarget(null); }}>
+        <DialogContent className="max-h-[90vh] overflow-hidden rounded-2xl sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="pr-8">图片提示词</DialogTitle>
+          </DialogHeader>
+          {promptTarget ? (
+            <>
+              <div className="flex min-w-0 items-center gap-3 border-b border-stone-100 pb-4">
+                <img
+                  src={promptTarget.thumbnail_url || promptTarget.url}
+                  alt={promptTarget.name}
+                  className="size-16 shrink-0 rounded-lg bg-stone-100 object-cover"
+                  onError={(event) => {
+                    if (event.currentTarget.src !== promptTarget.url) {
+                      event.currentTarget.src = promptTarget.url;
+                    }
+                  }}
+                />
+                <div className="min-w-0 text-xs text-stone-500">
+                  <div className="truncate font-medium text-stone-800">{promptTarget.name}</div>
+                  <div className="mt-1">{promptTarget.created_at}</div>
+                </div>
+              </div>
+              {targetPrompt || targetRevisedPrompt ? (
+                <div className="max-h-[55vh] space-y-5 overflow-y-auto pr-1">
+                  {targetPrompt ? (
+                    <section className="space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="text-sm font-semibold text-stone-800">原始提示词</h3>
+                        <Button variant="ghost" size="sm" className="h-8 rounded-lg px-2 text-stone-500" onClick={() => void copyPrompt(targetPrompt, "原始提示词")}>
+                          <Copy className="size-3.5" />
+                          复制
+                        </Button>
+                      </div>
+                      <div className="whitespace-pre-wrap [overflow-wrap:anywhere] text-sm leading-6 text-stone-700">{targetPrompt}</div>
+                    </section>
+                  ) : null}
+                  {targetRevisedPrompt && targetRevisedPrompt !== targetPrompt ? (
+                    <section className="space-y-2 border-t border-stone-100 pt-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="text-sm font-semibold text-stone-800">优化后提示词</h3>
+                        <Button variant="ghost" size="sm" className="h-8 rounded-lg px-2 text-stone-500" onClick={() => void copyPrompt(targetRevisedPrompt, "优化后提示词")}>
+                          <Copy className="size-3.5" />
+                          复制
+                        </Button>
+                      </div>
+                      <div className="whitespace-pre-wrap [overflow-wrap:anywhere] text-sm leading-6 text-stone-700">{targetRevisedPrompt}</div>
+                    </section>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="py-8 text-center text-sm text-stone-500">
+                  这张历史图片没有可用的提示词记录
+                </div>
+              )}
+            </>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" className="rounded-xl" onClick={() => setPromptTarget(null)}>
+              关闭
             </Button>
           </DialogFooter>
         </DialogContent>

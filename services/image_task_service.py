@@ -219,6 +219,7 @@ class ImageTaskService:
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
+                "prompt": _clean(payload.get("prompt")),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
                 "created_at": now,
@@ -383,6 +384,7 @@ class ImageTaskService:
                 "status": status,
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
                 "model": _clean(item.get("model"), "gpt-image-2"),
+                "prompt": _clean(item.get("prompt")),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
@@ -507,14 +509,15 @@ class ImageTaskService:
                 {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
+            # 恢复轮询也要把原始提示词写入最终图片的索引元数据。
             with self._lock:
                 task = self._tasks.get(key)
+                prompt = _clean(task.get("prompt")) if task else ""
                 quality = _clean(task.get("quality"), "auto") if task else "auto"
                 size = _clean(task.get("size")) if task else None
             data = format_image_result(
                 image_items,
-                "",  # prompt 已不重要，结果已经拿到了
+                prompt,
                 "b64_json",
                 "",
                 int(time.time()),

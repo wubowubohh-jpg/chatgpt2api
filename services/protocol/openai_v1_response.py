@@ -15,6 +15,7 @@ from services.protocol import codex_conversation_session, codex_response_text, c
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
+    TextConversationAccountSwitchRequired,
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
@@ -954,22 +955,34 @@ def _stream_plain_text_request(backend, request: ConversationRequest, *, attempt
         "original_wire_bytes_estimate": _controller_messages_wire_estimate(original_messages),
     })
     try:
-        for index, batch in enumerate(batches, start=1):
-            final = index == len(batches)
-            request.messages = [*batch, _plain_transport_marker(index, len(batches), final=final)]
-            _log_controller_request_shape(
-                request.messages,
-                tool_count=0,
-                attempt=f"{attempt}_preload_{index}_of_{len(batches)}",
-            )
-            if final:
-                yield from stream_text_deltas(backend, request)
-            else:
-                # Do not expose or cache an intermediate answer.  No client
-                # tools exist in this branch, so an unexpected model reply is
-                # harmless; the next batch continues from the same cursor.
-                for _delta in stream_text_deltas(backend, request):
-                    pass
+        while True:
+            try:
+                for index, batch in enumerate(batches, start=1):
+                    final = index == len(batches)
+                    request.messages = [*batch, _plain_transport_marker(index, len(batches), final=final)]
+                    _log_controller_request_shape(
+                        request.messages,
+                        tool_count=0,
+                        attempt=f"{attempt}_preload_{index}_of_{len(batches)}",
+                    )
+                    if final:
+                        yield from stream_text_deltas(backend, request)
+                    else:
+                        # Do not expose or cache an intermediate answer.  No client
+                        # tools exist in this branch, so an unexpected model reply is
+                        # harmless; the next batch continues from the same cursor.
+                        for _delta in stream_text_deltas(backend, request):
+                            pass
+                break
+            except TextConversationAccountSwitchRequired as exc:
+                logger.info({
+                    "event": "codex_plain_context_account_reset",
+                    "attempt": attempt,
+                })
+                request.conversation_id = ""
+                request.parent_message_id = ""
+                request.access_token = exc.replacement_token
+                continue
     finally:
         request.messages = original_messages
 

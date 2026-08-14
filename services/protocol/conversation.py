@@ -18,6 +18,7 @@ from services.model_service import normalize_model_identifier
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -58,6 +59,19 @@ class ImageGenerationError(Exception):
         if self.account_email:
             error_dict["error"]["account_email"] = self.account_email
         return error_dict
+
+
+class TextConversationAccountSwitchRequired(UpstreamHTTPError):
+    """Signals that an account-owned Web cursor must be rebuilt on another account."""
+
+    def __init__(self, source: UpstreamHTTPError, replacement_token: str) -> None:
+        super().__init__(
+            source.context,
+            source.status_code,
+            source.body,
+            retry_after=source.retry_after,
+        )
+        self.replacement_token = replacement_token
 
 
 def public_image_error_message(message: str) -> str:
@@ -149,8 +163,19 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
+def save_image_bytes(
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        prompt: str = "",
+        revised_prompt: str = "",
+) -> str:
+    return image_storage_service.save(
+        image_data,
+        base_url,
+        prompt=prompt,
+        revised_prompt=revised_prompt,
+    ).url
 
 
 def message_text(content: Any) -> str:
@@ -289,12 +314,22 @@ def format_image_result(
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(
+                    base64.b64decode(b64_json),
+                    base_url,
+                    prompt=prompt,
+                    revised_prompt=revised_prompt,
+                ),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(
+                    base64.b64decode(b64_json),
+                    base_url,
+                    prompt=prompt,
+                    revised_prompt=revised_prompt,
+                ),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -797,6 +832,35 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             return
         except Exception as exc:
             error_message = str(exc)
+            if (
+                token
+                and not emitted
+                and isinstance(exc, UpstreamHTTPError)
+                and exc.status_code == 429
+            ):
+                account_service.mark_text_rate_limited(token, retry_after=exc.retry_after)
+                replacement_token = ""
+                try:
+                    replacement_token = account_service.get_text_access_token(
+                        excluded_tokens=set(attempted_tokens),
+                        model=request.model,
+                    )
+                except UpstreamHTTPError as selection_error:
+                    if selection_error.status_code != 429:
+                        raise
+                if replacement_token:
+                    request.access_token = replacement_token
+                    if request.conversation_id or request.parent_message_id:
+                        # ChatGPT Web cursors are account-owned. The Responses
+                        # layer has the full Codex transcript needed to replay
+                        # safely; this low-level delta request does not.
+                        raise TextConversationAccountSwitchRequired(
+                            exc,
+                            replacement_token,
+                        ) from exc
+                    token = replacement_token
+                    continue
+                raise
             if token and not emitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:

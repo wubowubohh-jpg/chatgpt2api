@@ -202,7 +202,14 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+    def save(
+        self,
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        prompt: str = "",
+        revised_prompt: str = "",
+    ) -> StoredImage:
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
@@ -237,6 +244,12 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
+        cleaned_prompt = _clean(prompt)
+        cleaned_revised_prompt = _clean(revised_prompt)
+        if cleaned_prompt:
+            item["prompt"] = cleaned_prompt
+        if cleaned_revised_prompt:
+            item["revised_prompt"] = cleaned_revised_prompt
         with self._index_lock:
             items = self._load_clean_index()
             items[rel] = item

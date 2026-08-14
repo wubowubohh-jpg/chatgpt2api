@@ -264,6 +264,8 @@ export type ManagedImage = {
   width?: number;
   height?: number;
   tags?: string[];
+  prompt?: string;
+  revised_prompt?: string;
 };
 
 export type SystemLog = {
